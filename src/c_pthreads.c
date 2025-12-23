@@ -1,7 +1,44 @@
-#include "utils/utils.h"
+#include "../algebra.h"
 #include <assert.h>
 #include <omp.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdlib.h>
 #include <stdio.h>
+#include <math.h>
+
+
+typedef struct
+{
+    int j;
+    Matrix* L;
+    Matrix* A;
+    int start_i;
+    int end_i;
+} thread_data;
+
+pthread_t* threads = NULL;
+thread_data* thread_args = NULL;
+int NUM_THREADS = 2;
+
+void* compute_column(void* arg)
+{
+    thread_data* data = (thread_data*)arg;
+    int j = data->j;
+    Matrix* L = data->L;
+    Matrix* A = data->A;
+
+    for(int i = data->start_i; i < data->end_i; i++)
+    {
+        double s = 0.0;
+        for(int k = 0; k < j; k++)
+        {
+            s += L->data[i][k] * L->data[j][k];
+        }
+        L->data[i][j] = (1.0 / L->data[j][j]) * (A->data[i][j] - s);
+    }
+    pthread_exit(NULL);
+}
 
 static Matrix create_matrix_openmp(size_t rows, size_t cols)
 {
@@ -26,7 +63,7 @@ static Matrix create_matrix_openmp(size_t rows, size_t cols)
         die("calloc buf");
     }
 
-#pragma omp parallel for
+    // #pragma omp parallel for
     for(size_t i = 0; i < rows; ++i)
     {
         m.data[i] = m.buf + i * cols;
@@ -34,83 +71,31 @@ static Matrix create_matrix_openmp(size_t rows, size_t cols)
     return m;
 }
 
-Matrix generate_five_diag(size_t xn, size_t yn)
+
+Matrix generate_general_spd(size_t n)
 {
+    Matrix A = create_matrix(n, n);
 
-    size_t n, nn;
-    if(mul_overflow_size_t(xn, yn, &n) || mul_overflow_size_t(n, n, &nn))
-    {
-        fprintf(stderr, "Слишком большая сетка (переполнение).\n");
-        exit(EXIT_FAILURE);
-    }
-
-    Matrix A = create_matrix_openmp(n, n);
-#pragma omp parallel for
     for(size_t i = 0; i < n; ++i)
     {
-        // центр
-        A.data[i][i] = -4.0;
-
-        // вверх (i - xn)
-        if(i >= xn)
-        {
-            A.data[i][i - xn] = 1.0;
-        }
-        // вниз (i + xn)
-        if(i + xn < n)
-        {
-            A.data[i][i + xn] = 1.0;
-        }
-        // влево (i - 1) — не на левом краю строки
-        if((i % xn) != 0)
-        {
-            A.data[i][i - 1] = 1.0;
-        }
-        // вправо (i + 1) — не на правом краю строки
-        if((i % xn) != xn - 1)
-        {
-            A.data[i][i + 1] = 1.0;
-        }
-    }
-    return A;
-}
-
-Matrix generate_general_spd_openmp(size_t n)
-{
-    // Создаем плотную матрицу n×n
-    Matrix A = create_matrix_openmp(n, n);
-
-    // Параллельная инициализация всех элементов
-    // Нам нужно заполнить только диагонали:
-    // главную, ±1 и ±2.
-#pragma omp parallel for
-    for (size_t i = 0; i < n; ++i)
-    {
-        // Обнуляем на всякий случай (если calloc не гарантирует)
-        // Не обязателен, но безопасен при многопоточной инициализации
-        for (size_t j = 0; j < n; ++j)
-        {
-            A.data[i][j] = 0.0;
-        }
-
-        // Главная диагональ 6 вместо 4
+        // главная диагональ (4 -> 6)
         double diag = 6.0 + sin((double)i) + cos((double)i * (double)i);
         A.data[i][i] = diag;
 
-        // Под/над диагональ ±1
-        if (i > 0)
+        // соседние диагонали
+        if(i > 0)
         {
             double val1 = -1.0 + 0.5 * sin((double)i);
-            A.data[i][i - 1] = val1;
-            A.data[i - 1][i] = val1;
+            A.data[i][i-1] = val1;
+            A.data[i-1][i] = val1;
         }
 
-        // Под/над диагональ ±2
-        if (i > 1)
+        // первая и пятая диагонали
+        if(i > 1)
         {
             double val2 = -0.5 + 0.2 * cos((double)i);
-            A.data[i][i - 2] = val2;
-            A.data[i - 2][i] = val2;
+            A.data[i][i-2] = val2;
+            A.data[i-2][i] = val2;
         }
     }
 
@@ -119,18 +104,13 @@ Matrix generate_general_spd_openmp(size_t n)
 
 Vector generate_true_x(size_t n)
 {
-    // Создать вектор
     Vector x_star = create_vector(n);
-
-    // Параллельно заполняем элементы
-    #pragma omp parallel for schedule(static)
     for(size_t i = 0; i < n; ++i)
     {
         x_star.data[i] = sin((double)i)
                        + cos(sqrt((double)i))
                        + 0.3 * (double)i;
     }
-
     return x_star;
 }
 
@@ -228,13 +208,10 @@ double max_difference_between_vectors(Vector *a, Vector *b)
 double multiply_save_read_compare(Matrix *A, Vector *x,
                                   const char *filename_b)
 {
-    // 1) умножение и сохранение
     multiply_and_save(A, x, filename_b);
 
-    // 2) чтение обратно
     Vector b_from_file = read_vector_from_file(filename_b);
 
-    // 3) вычисление оригинного b
     Vector b_original = create_vector((int)A->rows);
     for (size_t i = 0; i < A->rows; ++i)
     {
@@ -244,54 +221,76 @@ double multiply_save_read_compare(Matrix *A, Vector *x,
         b_original.data[i] = sum;
     }
 
-    // 4) сравнение
     double max_diff = max_difference_between_vectors(&b_original, &b_from_file);
 
-    // Освобождение
     free_vector(b_from_file);
     free_vector(b_original);
 
     return max_diff;
 }
 
-
 Matrix cholesky(Matrix* A, int n)
 {
-    // double sum = 0;
-    // Matrix A_d = {A->rows, A->cols, A->data, A->buf};
-    // save_matrix_market(&A_d, "openmp_matrix_a", &sum);
-
     Matrix L = create_matrix_openmp(n, n);
     assert(A->cols == A->rows);
     assert(A->cols == n);
 
+    pthread_t threads[NUM_THREADS];
+    thread_data thread_args[NUM_THREADS];
+
+    bool thread_created[NUM_THREADS]; 
+
     for(int j = 0; j < n; j++)
     {
-        double s = 0;
+        for(int t = 0; t < NUM_THREADS; t++)
+        {
+            thread_created[t] = false;
+        }
+
+        double s = 0.0;
         for(int k = 0; k < j; k++)
         {
             s += L.data[j][k] * L.data[j][k];
         }
         L.data[j][j] = sqrt(A->data[j][j] - s);
-#pragma omp parallel for
-        for(int i = j + 1; i < n; i++)
+
+        int rows_remaining = n - j - 1;
+        if(rows_remaining > 0)
         {
-            double s = 0;
-            for(int k = 0; k < j; k++)
+            int chunk_size = rows_remaining / NUM_THREADS;
+            int extra = rows_remaining % NUM_THREADS;
+            int current_start = j + 1;
+
+            for(int t = 0; t < NUM_THREADS; t++)
             {
-                s += L.data[i][k] * L.data[j][k];
+                int thread_rows = chunk_size + (t < extra ? 1 : 0);
+                if(thread_rows > 0)
+                {
+                    thread_args[t] =
+                        (thread_data){.j = j,
+                                      .L = &L,
+                                      .A = A,
+                                      .start_i = current_start,
+                                      .end_i = current_start + thread_rows};
+                    if(pthread_create(&threads[t], NULL, compute_column,
+                                      &thread_args[t]) == 0)
+                    {
+                        thread_created[t] = true;
+                    }
+                    current_start += thread_rows;
+                }
             }
-            L.data[i][j] = (1.0 / L.data[j][j] * (A->data[i][j] - s));
+            for(int t = 0; t < NUM_THREADS; t++)
+            {
+                if(thread_created[t])
+                {
+                    pthread_join(threads[t], NULL);
+                }
+            }
         }
     }
-    // double sum2 = 0;
-    // Matrix L_d = {L.rows, L.cols, L.data, L.buf};
-    // save_matrix_market(&L_d, "openmp_matrix_l", &sum2);
-    // printf(" check sum = %f", sum2);
-
     return L;
 }
-
 Vector solve_gauss_reverse(Matrix* U, Vector* b)
 {
     int n = U->rows;
@@ -432,79 +431,37 @@ Vector pcgPreconditioned(Matrix* A, Vector* b, Vector* xs, double err,
     return x;
 }
 
-void errByEpsPcgChol(double a, double b, double c, double d, double h)
+void pcgChol(size_t n,
+                             const char *b_filename,
+                             double eps)
 {
-    Vector x = linspace(a, b, (b - a) / h + 1);
-    Vector y = linspace(c, d, (d - c) / h + 1);
-    Vector us = uForXY(&x, &y);
-    Vector B = F(&x, &y);
-    int n = (x.size - 2) * (y.size - 2);
-    Matrix A = generate_five_diag(x.size - 2, y.size - 2);
-    printf("%zu, %zu, %i, %i, %i\n", A.cols, A.rows, B.size, x.size, y.size);
-    scalar_mul_self(A, -1);
+    printf("=== General SPD PCG + Cholesky ===\n");
+    printf("Matrix size: %zu x %zu\n", n, n);
 
-    scalar_vector_mult_self(&B, -1);
+    Matrix A = generate_general_spd(n);
 
-    // printf("----\n");
+    Vector x_true = generate_true_x(n);
 
-    Matrix L = cholesky(&A, A.cols);
-    Matrix Lt = transpose(L);
-    Vector zeros = create_vector(n);
-    int i = 3;
+    Vector b = read_vector_from_file(b_filename);
 
-    double eps = pow(10, -i);
-    double relres = 0;
-    int count = 0;
-
-    Vector Sol =
-        pcgPreconditioned(&A, &B, &zeros, eps, &relres, &count, &L, &Lt);
-    double max = vectors_max_diff(&us, &Sol);
-    printf(", iter = %i, eps = %.15f, max_comp_diff =  %.15f\n", count, eps,
-           max);
-    free_vector(Sol);
-
-    free_vector(x);
-    free_vector(y);
-    free_vector(us);
-    free_vector(B);
-    free_matrix(&A);
-    free_matrix(&L);
-    free_matrix(&Lt);
-    free_vector(zeros);
-}
-
-void errByEpsPcgChol_general_openmp(size_t n, const char *b_filename, double eps)
-{
-    printf("=== OpenMP: General SPD + PCG + Cholesky ===\n");
-    printf("Matrix size: %zu x %zu, eps = %.3e\n", n, n, eps);
-
-    // 1) Read right-hand side vector from file
-    Vector B = read_vector_from_file(b_filename);
-    if ((size_t)B.size != n)
+    if ((size_t)b.size != n)
     {
-        fprintf(stderr, "Error: vector B has size %d but matrix size is %zu\n", B.size, n);
+        fprintf(stderr, "Размер b не совпадает с размером матрицы\n");
         exit(EXIT_FAILURE);
     }
 
-    // 2) Generate general SPD matrix using OpenMP
-    Matrix A = generate_general_spd_openmp(n);
-    Vector x_true = generate_true_x(n);
-
-    // 3) Compute Cholesky factorization in parallel
-    printf("Running OpenMP Cholesky factorization...\n");
+    printf("Cholesky decomposition...\n");
     Matrix L = cholesky(&A, (int)n);
     Matrix Lt = transpose(L);
 
-    // 4) Initial guess x0 = zero vector
     Vector x0 = create_vector(n);
 
     double relres = 0.0;
     int iter = 0;
 
-    // 5) Run Preconditioned CG with Cholesky preconditioner
-    Vector Xsol = pcgPreconditioned(
+    Vector x_sol = pcgPreconditioned(
         &A,
-        &B,
+        &b,
         &x0,
         eps,
         &relres,
@@ -513,20 +470,16 @@ void errByEpsPcgChol_general_openmp(size_t n, const char *b_filename, double eps
         &Lt
     );
 
-    // 6) Generate true solution vector x_true
-
-    // 7) Compute max difference between PCG solution and true x*
-    double max_err = max_difference_between_vectors(&x_true, &Xsol);
+    double max_err = max_difference_between_vectors(&x_true, &x_sol);
 
     printf("PCG finished\n");
     printf("Iterations: %d\n", iter);
     printf("Relative residual: %.3e\n", relres);
     printf("Max |x - x*|: %.3e\n", max_err);
 
-    // 8) Free memory
-    free_vector(Xsol);
+    free_vector(x_sol);
     free_vector(x0);
-    free_vector(B);
+    free_vector(b);
     free_vector(x_true);
     free_matrix(&A);
     free_matrix(&L);
@@ -535,28 +488,59 @@ void errByEpsPcgChol_general_openmp(size_t n, const char *b_filename, double eps
 
 
 
-int main()
+
+
+int main(int argc, char** argv)
 {
+    if(argc < 2)
+    {
+        printf("Usage: %s <num_threads>\n", argv[0]);
+        return 1;
+    }
+
+    NUM_THREADS = atoi(argv[1]);
+    if(NUM_THREADS <= 0)
+    {
+        printf("Error: Number of threads must be positive\n");
+        return 1;
+    }
+
+    threads = (pthread_t*)malloc(NUM_THREADS * sizeof(pthread_t));
+    thread_args = (thread_data*)malloc(NUM_THREADS * sizeof(thread_data));
+
+    if(!threads || !thread_args)
+    {
+        fprintf(stderr, "Error: memory allocation failed\n");
+        free(threads);
+        free(thread_args);
+        return 1;
+    }
+
     size_t n = 4096;
-    const char *bfile = "b_vector.txt"; 
+    const char *bfile = "b_vector.txt";
     double eps = 1e-8;
 
-    errByEpsPcgChol_general_openmp(n, bfile, eps);
+    pcgChol(n, bfile, eps);
+
+    free(threads);
+    free(thread_args);
 
     return 0;
 }
 
 
 
-// int main()
-// {
-//     double a = 0;
-//     double b = 1.5;
-//     double c = 0;
-//     double d = 1.5;
-//     double h = 0.05;
+// int main(int argc, char** argv) {
+//     size_t n = 4096;
+//     Matrix A = generate_general_spd(n);   
+//     // print_matrix(&A);     
+//     Vector x = generate_true_x(n);             
+//     const char *fname = "b_vector.txt";
 
-//     errByEpsPcgChol(a, b, c, d, h);
+//     double maxdiff = multiply_save_read_compare(&A, &x, fname);
 
-//     return 0;
+//     printf("Max difference = %.15f\n", maxdiff);
+
+//     free_matrix(&A);
+//     free_vector(x);
 // }

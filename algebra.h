@@ -7,28 +7,21 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Структура для хранения матрицы
-// typedef struct
-// {
-//     int rows;
-//     int cols;
-//     double** data;
-// } Matrix;
 
 typedef struct
 {
     size_t rows;
     size_t cols;
-    double** data; // массив указателей на строки
-    double* buf; // единый непрерывный буфер данных rows*cols
+    double** data; 
+    double* buf; 
 } Matrix;
 
-// Структура для хранения вектора
 typedef struct
 {
     int size;
     double* data;
 } Vector;
+
 
 static void die(const char* msg)
 {
@@ -88,32 +81,6 @@ void save_matrix_to_file(Matrix* mat)
     }
 }
 
-// Создание матрицы
-// Matrix create_matrix(int rows, int cols)
-// {
-//     Matrix mat;
-//     mat.rows = rows;
-//     mat.cols = cols;
-//     mat.data = (double**)malloc(rows * sizeof(double*));
-//     for(int i = 0; i < rows; i++)
-//     {
-//         double* ptr = (double*)malloc(cols * sizeof(double));
-//         if(ptr)
-//         {
-//             mat.data[i] = ptr;
-//         }
-//         else
-//         {
-//             exit(EXIT_FAILURE);
-//         }
-//         for(int j = 0; j < cols; j++)
-//         {
-//             mat.data[i][j] = 0.0;
-//         }
-//     }
-//     // save_matrix_to_file(&mat);
-//     return mat;
-// }
 
 static Matrix create_matrix(size_t rows, size_t cols)
 {
@@ -564,17 +531,14 @@ double vectors_max_diff(Vector* left, Vector* right)
 
 char* create_filename(const char* prefix, int number)
 {
-    // Allocate memory for the filename
-    // Format: prefix_number.ext (e.g., "file_001.txt")
     char* filename =
-        malloc(strlen(prefix) + 15); // Extra space for number and extension
+        malloc(strlen(prefix) + 15); 
 
     if(filename == NULL)
     {
-        return NULL; // Memory allocation failed
+        return NULL; 
     }
 
-    // Create the filename
     sprintf(filename, "%s_%03d.txt", prefix, number);
 
     return filename;
@@ -589,7 +553,6 @@ void save_matrix_market(Matrix* A, const char* filename, double* check_sum)
         return;
     }
 
-    // Count nonzeros
     size_t nnz = 0;
     for(size_t i = 0; i < A->rows; i++)
     {
