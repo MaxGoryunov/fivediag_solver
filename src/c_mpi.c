@@ -1,5 +1,5 @@
 #include "../algebra.h"
-#include "utils/utils.h"
+// #include "utils/utils.h"
 #include <assert.h>
 #include <mpi.h>
 #include <stdio.h>

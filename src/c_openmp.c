@@ -1,4 +1,5 @@
-#include "utils/utils.h"
+// #include "utils/utils.h"
+#include "../algebra.h"
 #include <assert.h>
 #include <omp.h>
 #include <stdio.h>
@@ -42,10 +43,10 @@ Matrix generate_general_spd_openmp(size_t n)
 #pragma omp parallel for
     for (size_t i = 0; i < n; ++i)
     {
-        for (size_t j = 0; j < n; ++j)
-        {
-            A.data[i][j] = 0.0;
-        }
+        // for (size_t j = 0; j < n; ++j)
+        // {
+        //     A.data[i][j] = 0.0;
+        // }
 
         // Главная диагональ 6 вместо 4
         double diag = 6.0 + sin((double)i) + cos((double)i * (double)i);
@@ -431,6 +432,21 @@ void pcgCholOpenmp(size_t n, const char *b_filename, double eps)
 int main()
 {
     size_t n = 4096;
+
+
+    // Matrix A = generate_general_spd_openmp(n);   
+    // // print_matrix(&A);     
+    // Vector x = generate_true_x(n);             
+    // const char *fname = "b_vector.txt";
+
+    // double maxdiff = multiply_save_read_compare(&A, &x, fname);
+
+    // printf("Max difference = %.15f\n", maxdiff);
+
+    // free_matrix(&A);
+    // free_vector(x);
+
+
     const char *bfile = "b_vector.txt"; 
     double eps = 1e-8;
 
@@ -438,4 +454,19 @@ int main()
 
     return 0;
 }
+
+// int main(int argc, char** argv) {
+//     size_t n = 4096;
+//     Matrix A = generate_general_spd(n);   
+//     // print_matrix(&A);     
+//     Vector x = generate_true_x(n);             
+//     const char *fname = "b_vector.txt";
+
+//     double maxdiff = multiply_save_read_compare(&A, &x, fname);
+
+//     printf("Max difference = %.15f\n", maxdiff);
+
+//     free_matrix(&A);
+//     free_vector(x);
+// }
 

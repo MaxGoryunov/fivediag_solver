@@ -11,7 +11,7 @@ fi
 KEY="$1"
 SERVER="$2"
 LOCAL="."
-REMOTE="fivediag"
+REMOTE="fived"
 
 # Check if local folder exists
 [ -d "$LOCAL" ] || { echo "Error: $LOCAL not found"; exit 1; }
@@ -26,6 +26,8 @@ ssh -i ~/.ssh/"$KEY" "$SERVER" "mkdir -p ~/$REMOTE"
 scp -r -i ~/.ssh/"$KEY" "$LOCAL"/src "$SERVER":~/"$REMOTE"/
 scp -i ~/.ssh/"$KEY" "$LOCAL"/*.sh "$SERVER":~/"$REMOTE"/
 scp -i ~/.ssh/"$KEY" "$LOCAL"/*.slurm "$SERVER":~/"$REMOTE"/
+scp -i ~/.ssh/"$KEY" "$LOCAL"/b_vector.txt "$SERVER":~/"$REMOTE"/
+scp -i ~/.ssh/"$KEY" "$LOCAL"/algebra.h "$SERVER":~/"$REMOTE"/
 scp -i ~/.ssh/"$KEY" "$LOCAL"/CMakeLists.txt "$SERVER":~/"$REMOTE"/
 
 echo "Done"

@@ -269,7 +269,7 @@ def pcg_chol_MPI(filename_b, n, eps, comm):
             A, b_vec, x0, eps, L=L, Lt=L.T
         )
 
-        print(f"eps={eps:.1e}, iterations={iterations}, relres={0.000000000005002:.3e}")
+        print(f"eps={eps:.1e}, iterations={iterations}, relres={relres:.3e}")
 
     free_shared_matrix(A_mpi)
     free_shared_matrix(L_mpi)

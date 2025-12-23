@@ -490,57 +490,57 @@ void pcgChol(size_t n,
 
 
 
-int main(int argc, char** argv)
-{
-    if(argc < 2)
-    {
-        printf("Usage: %s <num_threads>\n", argv[0]);
-        return 1;
-    }
+// int main(int argc, char** argv)
+// {
+//     if(argc < 2)
+//     {
+//         printf("Usage: %s <num_threads>\n", argv[0]);
+//         return 1;
+//     }
 
-    NUM_THREADS = atoi(argv[1]);
-    if(NUM_THREADS <= 0)
-    {
-        printf("Error: Number of threads must be positive\n");
-        return 1;
-    }
+//     NUM_THREADS = atoi(argv[1]);
+//     if(NUM_THREADS <= 0)
+//     {
+//         printf("Error: Number of threads must be positive\n");
+//         return 1;
+//     }
 
-    threads = (pthread_t*)malloc(NUM_THREADS * sizeof(pthread_t));
-    thread_args = (thread_data*)malloc(NUM_THREADS * sizeof(thread_data));
+//     threads = (pthread_t*)malloc(NUM_THREADS * sizeof(pthread_t));
+//     thread_args = (thread_data*)malloc(NUM_THREADS * sizeof(thread_data));
 
-    if(!threads || !thread_args)
-    {
-        fprintf(stderr, "Error: memory allocation failed\n");
-        free(threads);
-        free(thread_args);
-        return 1;
-    }
+//     if(!threads || !thread_args)
+//     {
+//         fprintf(stderr, "Error: memory allocation failed\n");
+//         free(threads);
+//         free(thread_args);
+//         return 1;
+//     }
 
-    size_t n = 4096;
-    const char *bfile = "b_vector.txt";
-    double eps = 1e-8;
-
-    pcgChol(n, bfile, eps);
-
-    free(threads);
-    free(thread_args);
-
-    return 0;
-}
-
-
-
-// int main(int argc, char** argv) {
 //     size_t n = 4096;
-//     Matrix A = generate_general_spd(n);   
-//     // print_matrix(&A);     
-//     Vector x = generate_true_x(n);             
-//     const char *fname = "b_vector.txt";
+//     const char *bfile = "b_vector.txt";
+//     double eps = 1e-8;
 
-//     double maxdiff = multiply_save_read_compare(&A, &x, fname);
+//     pcgChol(n, bfile, eps);
 
-//     printf("Max difference = %.15f\n", maxdiff);
+//     free(threads);
+//     free(thread_args);
 
-//     free_matrix(&A);
-//     free_vector(x);
+//     return 0;
 // }
+
+
+
+int main(int argc, char** argv) {
+    size_t n = 4096;
+    Matrix A = generate_general_spd(n);   
+    // print_matrix(&A);     
+    Vector x = generate_true_x(n);             
+    const char *fname = "b_vector.txt";
+
+    double maxdiff = multiply_save_read_compare(&A, &x, fname);
+
+    printf("Max difference = %.15f\n", maxdiff);
+
+    free_matrix(&A);
+    free_vector(x);
+}

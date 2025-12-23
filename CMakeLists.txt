@@ -18,9 +18,9 @@ set(COMMON_COMPILE_OPTIONS
 set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -g")
 set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O2")
 
-add_executable(main_executable src/main.c)
-target_link_libraries(main_executable PRIVATE m)
-target_compile_options(main_executable PRIVATE ${COMMON_COMPILE_OPTIONS})
+# add_executable(main_executable src/main.c)
+# target_link_libraries(main_executable PRIVATE m)
+# target_compile_options(main_executable PRIVATE ${COMMON_COMPILE_OPTIONS})
 
 find_package(OpenMP REQUIRED)
 add_executable(main_executable_openmp src/c_openmp.c)
