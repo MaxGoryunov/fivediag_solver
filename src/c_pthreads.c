@@ -291,6 +291,7 @@ Matrix cholesky(Matrix* A, int n)
     }
     return L;
 }
+
 Vector solve_gauss_reverse(Matrix* U, Vector* b)
 {
     int n = U->rows;

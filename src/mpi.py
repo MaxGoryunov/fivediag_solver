@@ -250,14 +250,12 @@ def pcg_preconditioned(A, b, x0, tol, max_iter=1000, L=None, Lt=None):
 
 
 def block_indices(n, b):
-    """Generate block index pairs for n x n with block size b."""
     nb = (n + b - 1) // b
     for i in range(nb):
         for j in range(i + 1):
             yield i, j
 
 def owner(i, j, size):
-    """Simple owner mapping: wrap block (i,j) to rank."""
     return (i * (i + 1) // 2 + j) % size
 
 def cholesky_blocked_mpi(A, b, comm):
@@ -267,10 +265,8 @@ def cholesky_blocked_mpi(A, b, comm):
     n = A.shape[0]
     nb = (n + b - 1) // b
 
-    # Local storage for blocks owned by this rank
     local_blocks = {}
 
-    # Scatter A into blocks
     if rank == 0:
         blocks = {}
         for i, j in block_indices(n, b):
@@ -278,7 +274,6 @@ def cholesky_blocked_mpi(A, b, comm):
             I_len = min(b, n - Ii)
             J_len = min(b, n - Ji)
             blocks[(i,j)] = A[Ii:Ii+I_len, Ji:Ji+J_len].copy()
-        # Send blocks to owners
         for (i,j), blk in blocks.items():
             tgt = owner(i,j, size)
             if tgt == 0:
@@ -292,11 +287,9 @@ def cholesky_blocked_mpi(A, b, comm):
 
     comm.Barrier()
 
-    # Workspace for received blocks
     recv_buf = {}
 
     for k in range(nb):
-        # 1) Factorize diagonal block
         if (k,k) in local_blocks:
             Lkk = np.linalg.cholesky(local_blocks[(k,k)])
             local_blocks[(k,k)] = Lkk
@@ -304,7 +297,6 @@ def cholesky_blocked_mpi(A, b, comm):
             Lkk = None
         Lkk = comm.bcast(Lkk, root=owner(k,k,size))
 
-        # 2) Compute column blocks under diagonal
         for i in range(k+1, nb):
             if (i,k) in local_blocks:
                 Aik = local_blocks[(i,k)]
@@ -317,7 +309,6 @@ def cholesky_blocked_mpi(A, b, comm):
 
         comm.Barrier()
 
-        # 3) Update tail blocks
         for i in range(k+1, nb):
             for j in range(k+1, i+1):
                 if (i,j) in local_blocks:
@@ -331,21 +322,17 @@ def cholesky_blocked_mpi(A, b, comm):
                 if Aij.size != 0:
                     Aij -= Lik @ Ljk.T
                     if i == j:
-                        # Make it symmetric
                         Aij = np.tril(Aij)
                     local_blocks[(i,j)] = Aij
 
         comm.Barrier()
 
-    # Gather results back to rank 0
     L = None
     if rank == 0:
         L = np.zeros_like(A)
-        # Place own blocks
         for (i,j), blk in local_blocks.items():
             Ii, Ji = i*b, j*b
             L[Ii: Ii+blk.shape[0], Ji: Ji+blk.shape[1]] = blk
-        # Receive others
         for r in range(1, size):
             for i,j in block_indices(n,b):
                 if owner(i,j,size) == r:
