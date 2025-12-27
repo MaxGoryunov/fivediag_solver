@@ -1,6 +1,15 @@
 # Prerequisites
 *.d
 
+.*
+build
+copenmp
+main
+myprog
+openmp
+posix
+pthreads
+
 # Object files
 *.o
 *.ko
