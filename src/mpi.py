@@ -38,11 +38,11 @@ def free_shared_matrix(mat):
     if mat:
         mat.free()
 
-def generate_general_spd_mpi(xn, yn, comm):
+def generate_general_spd_mpi(xn, comm):
     rank = comm.Get_rank()
     size = comm.Get_size()
 
-    n = xn * yn
+    n = xn
     A = create_shared_matrix(n, n, comm)
     rows_per_proc = n // size
     remainder = n % size
@@ -249,12 +249,128 @@ def pcg_preconditioned(A, b, x0, tol, max_iter=1000, L=None, Lt=None):
 
 
 
+def block_indices(n, b):
+    """Generate block index pairs for n x n with block size b."""
+    nb = (n + b - 1) // b
+    for i in range(nb):
+        for j in range(i + 1):
+            yield i, j
+
+def owner(i, j, size):
+    """Simple owner mapping: wrap block (i,j) to rank."""
+    return (i * (i + 1) // 2 + j) % size
+
+def cholesky_blocked_mpi(A, b, comm):
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
+    n = A.shape[0]
+    nb = (n + b - 1) // b
+
+    # Local storage for blocks owned by this rank
+    local_blocks = {}
+
+    # Scatter A into blocks
+    if rank == 0:
+        blocks = {}
+        for i, j in block_indices(n, b):
+            Ii, Ji = i*b, j*b
+            I_len = min(b, n - Ii)
+            J_len = min(b, n - Ji)
+            blocks[(i,j)] = A[Ii:Ii+I_len, Ji:Ji+J_len].copy()
+        # Send blocks to owners
+        for (i,j), blk in blocks.items():
+            tgt = owner(i,j, size)
+            if tgt == 0:
+                local_blocks[(i,j)] = blk
+            else:
+                comm.send(blk, dest=tgt, tag=1000+i*nb+j)
+    else:
+        for i, j in block_indices(n,b):
+            if owner(i,j,size) == rank:
+                local_blocks[(i,j)] = comm.recv(source=0, tag=1000+i*nb+j)
+
+    comm.Barrier()
+
+    # Workspace for received blocks
+    recv_buf = {}
+
+    for k in range(nb):
+        # 1) Factorize diagonal block
+        if (k,k) in local_blocks:
+            Lkk = np.linalg.cholesky(local_blocks[(k,k)])
+            local_blocks[(k,k)] = Lkk
+        else:
+            Lkk = None
+        Lkk = comm.bcast(Lkk, root=owner(k,k,size))
+
+        # 2) Compute column blocks under diagonal
+        for i in range(k+1, nb):
+            if (i,k) in local_blocks:
+                Aik = local_blocks[(i,k)]
+                Lik = np.linalg.solve(Lkk, Aik.T).T
+                local_blocks[(i,k)] = Lik
+            else:
+                Lik = None
+            Lik = comm.bcast(Lik, root=owner(i,k,size))
+            recv_buf[(i,k)] = Lik
+
+        comm.Barrier()
+
+        # 3) Update tail blocks
+        for i in range(k+1, nb):
+            for j in range(k+1, i+1):
+                if (i,j) in local_blocks:
+                    Aij = local_blocks[(i,j)]
+                else:
+                    Aij = np.zeros((0,0))
+
+                Lik = recv_buf[(i,k)]
+                Ljk = recv_buf[(j,k)]
+
+                if Aij.size != 0:
+                    Aij -= Lik @ Ljk.T
+                    if i == j:
+                        # Make it symmetric
+                        Aij = np.tril(Aij)
+                    local_blocks[(i,j)] = Aij
+
+        comm.Barrier()
+
+    # Gather results back to rank 0
+    L = None
+    if rank == 0:
+        L = np.zeros_like(A)
+        # Place own blocks
+        for (i,j), blk in local_blocks.items():
+            Ii, Ji = i*b, j*b
+            L[Ii: Ii+blk.shape[0], Ji: Ji+blk.shape[1]] = blk
+        # Receive others
+        for r in range(1, size):
+            for i,j in block_indices(n,b):
+                if owner(i,j,size) == r:
+                    blk = comm.recv(source=r, tag=2000+i*nb+j)
+                    Ii, Ji = i*b, j*b
+                    L[Ii: Ii+blk.shape[0], Ji: Ji+blk.shape[1]] = blk
+    else:
+        for (i,j), blk in local_blocks.items():
+            comm.send(blk, dest=0, tag=2000+i*nb+j)
+
+    return L
+
+
+
 def pcg_chol_MPI(filename_b, n, eps, comm):
     rank = comm.Get_rank()
     b_vec = read_vector_from_file_mpi(filename_b, comm)
-
-    A_mpi = generate_general_spd_mpi(n, 1, comm)
-    L_mpi = cholesky_mpi(A_mpi, n, comm)
+    # print(f"Read b_vec, {len(b_vec)}")
+    A_mpi = generate_general_spd_mpi(n, comm)
+    if rank == 0:
+        print(f"{A_mpi.rows = }")
+    # L_mpi = cholesky_mpi(A_mpi, n, comm)
+    L_mpi = cholesky_blocked_mpi(A_mpi.data, b=64, comm=MPI.COMM_WORLD)
+    if rank == 0:
+        print(f"Finished Cholesky, {L_mpi.shape = }")
 
     if rank == 0:
         A = A_mpi.data
@@ -262,7 +378,10 @@ def pcg_chol_MPI(filename_b, n, eps, comm):
         # print(A)
         # print('b (right side):')
         # print(b_vec)
-        L = L_mpi.data
+        
+        # if pure numpy matrix
+        # L = L_mpi.data
+        L = L_mpi
         x0 = np.zeros(n, dtype=np.float64)
 
         sol, iterations, relres = pcg_preconditioned(
@@ -272,7 +391,7 @@ def pcg_chol_MPI(filename_b, n, eps, comm):
         print(f"eps={eps:.1e}, iterations={iterations}, relres={relres:.3e}")
 
     free_shared_matrix(A_mpi)
-    free_shared_matrix(L_mpi)
+    # free_shared_matrix(L_mpi)
 
     comm.Barrier()
 
@@ -285,6 +404,7 @@ def main():
 
     if rank == 0:
         print("Starting MPI Python program")
+    # print(f"Starting MPI Python program on {rank = }")
 
     filename_b = "b_vector.txt"
     n = 4096
