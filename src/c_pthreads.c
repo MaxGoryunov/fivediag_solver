@@ -17,8 +17,42 @@ typedef struct
     int end_i;
 } thread_data;
 
+typedef struct
+{
+    int bi, bj, bk;   // индексы блоков
+    Matrix* L;        // результирующая L
+    Matrix* A;        // исходная матрица
+    int block_size;   // размер блока b
+    int start_row;
+    int end_row;
+} thread_data_tri;
+
+typedef struct
+{
+    int bi, bj, bk;       // индексы блоков (i,j,k)
+    Matrix* A;            // исходная матрица/накопленный результат
+    Matrix* L;            // матрица L
+    int block_size;       // размер блока b
+    int start_row;        // начало строки в блоке
+    int end_row;          // конец строки в блоке (не включая)
+} thread_data_update;
+
+typedef struct
+{
+    int bi;           // индекс блока по строкам
+    int bj;           // индекс блока по столбцам
+    int bk;           // индекс текущего шага (треугольная позиция)
+    Matrix* A;        // исходная матрица (или хвостовая часть)
+    Matrix* L;        // результирующая матрица L
+    int block_size;   // размер блока b
+    int start_row;    // первая строка в блоке, которую обрабатывает поток
+    int end_row;      // первая строка после последней (i < end_row)
+} thread_block_data;
+
+const char* MATRIX_DEBUG = "matrix_debug.txt";
+
 pthread_t* threads = NULL;
-thread_data* thread_args = NULL;
+thread_block_data* thread_args = NULL;
 int NUM_THREADS = 2;
 
 void* compute_column(void* arg)
@@ -229,6 +263,271 @@ double multiply_save_read_compare(Matrix *A, Vector *x,
     return max_diff;
 }
 
+static inline void block_indices(int nb, int *bi, int *bj, int idx) {
+    int count = 0;
+    for(int i = 0; i < nb; i++) {
+        for(int j = 0; j <= i; j++) {
+            if(count == idx) {
+                *bi = i;
+                *bj = j;
+                return;
+            }
+            count++;
+        }
+    }
+}
+
+static inline int owner_block(int bi, int bj, int num_threads) {
+    int block_id = bi * (bi + 1) / 2 + bj;
+    return block_id % num_threads;
+}
+
+// С = Cholesky(A) для блока размера b x b
+// A и L — двумерные массивы размером b x b
+void factorize_block(double** A, double** L, int b) {
+    for(int i = 0; i < b; i++) {
+        for(int j = 0; j < b; j++) {
+            L[i][j] = 0.0;
+        }
+    }
+    for(int i = 0; i < b; i++) {
+        for(int j = 0; j <= i; j++) {
+            L[i][j] = A[i][j];
+        }
+    }
+
+    for(int k = 0; k < b; k++) {
+        double sum = 0.0;
+        for(int p = 0; p < k; p++) {
+            sum += L[k][p] * L[k][p];
+        }
+
+        L[k][k] = sqrt(L[k][k] - sum);
+
+        for(int i = k + 1; i < b; i++) {
+            double sum2 = 0.0;
+            for(int p = 0; p < k; p++) {
+                sum2 += L[i][p] * L[k][p];
+            }
+            L[i][k] = (L[i][k] - sum2) / L[k][k];
+        }
+    }
+}
+
+
+void* solve_triangular_block(void* arg)
+{
+    thread_block_data* data = (thread_block_data*) arg;
+
+    int bi = data->bi;
+    int bk = data->bk;
+    int b  = data->block_size;
+
+    Matrix* A = data->A;
+    Matrix* L = data->L;
+
+    int row_start = data->start_row;
+    int row_end   = data->end_row;
+
+    int Ai = bi * b;
+    int Ak = bk * b;
+
+    for(int i = row_start; i < row_end; i++)
+    {
+        for(int j = 0; j < b; j++)
+        {
+            double s = 0.0;
+            for(int p = 0; p < j; p++)
+            {
+                s += L->data[(Ai + i)][(bk * b + p)] *
+                     L->data[(bk * b + j)][(bk * b + p)];
+            }
+
+            L->data[(Ai + i)][(bk * b + j)] =
+                (A->data[(Ai + i)][(bk * b + j)] - s)
+                / L->data[(bk * b + j)][(bk * b + j)];
+        }
+    }
+
+    pthread_exit(NULL);
+}
+
+void* update_trailing_block(void* arg)
+{
+    thread_block_data* data = (thread_block_data*)arg;
+
+    int bi = data->bi;
+    int bj = data->bj;
+    int bk = data->bk;
+    int b  = data->block_size;
+
+    Matrix* A = data->A;
+    Matrix* L = data->L;
+
+    // Смещение блока в глобальной матрице
+    int Ai = bi * b;
+    int Aj = bj * b;
+    int Ak = bk * b;
+
+    int row_start = data->start_row;
+    int row_end   = data->end_row;
+
+    for (int i = row_start; i < row_end; i++)
+    {
+        // Для каждой строки i текущего блока
+        for (int j = 0; j < b; j++)
+        {
+            double sum = 0.0;
+
+            // Вычисляем сумму L[i,k] * L[j,k] для k = 0..b-1
+            for (int p = 0; p < b; p++)
+            {
+                sum += L->data[(Ai + i)][(Ak + p)] *
+                       L->data[(Aj + j)][(Ak + p)];
+            }
+
+            // Вычитаем вклад из блока A
+            A->data[(Ai + i)][(Aj + j)] -= sum;
+        }
+    }
+
+    pthread_exit(NULL);
+}
+
+
+void print_flat_matrix(double** A, int n) {
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            printf("%8.2f ", A[i][j]);
+        }
+        printf("\n");
+    }
+}
+
+Matrix cholesky_blocked_pthreads(Matrix* A, int n, int b)
+{
+    assert(A->cols == A->rows);
+    assert(A->cols == n);
+
+    Matrix L = create_matrix_openmp(n, n);
+
+    int nb = (n + b - 1) / b;
+
+    pthread_t threads[NUM_THREADS];
+    thread_block_data thread_args[NUM_THREADS];
+    bool thread_created[NUM_THREADS];
+
+    for (int k = 0; k < nb; k++)
+    {
+        {
+            int bi = k, bj = k;
+            int rows = ((bi * b + b) > n ? (n - bi * b) : b);
+
+            double** Ablock = allocate_block(rows);
+            double** Lblock = allocate_block(rows);
+
+            for (int ii = 0; ii < rows; ii++)
+                for (int jj = 0; jj < rows; jj++)
+                    Ablock[ii][jj] = A->data[bi*b + ii][bj*b + jj];
+            // print_flat_matrix(Ablock, rows);
+            
+
+            factorize_block(Ablock, Lblock, rows);
+            // printf("L block %i\n", k);
+            // print_flat_matrix(Lblock, rows);
+
+            for (int ii = 0; ii < rows; ii++)
+                for (int jj = 0; jj < rows; jj++)
+                    L.data[bi*b + ii][bj*b + jj] = Lblock[ii][jj];
+
+            free_block(Ablock, rows);
+            free_block(Lblock, rows);
+        }
+
+        for (int t = 0; t < NUM_THREADS; t++)
+            thread_created[t] = false;
+
+        for (int i = k + 1; i < nb; i++)
+        {
+            int rows = ((i * b + b) > n ? (n - i*b) : b);
+
+            int chunk = rows / NUM_THREADS;
+            int rem   = rows % NUM_THREADS;
+            int start = 0;
+            int thread_index = 0;
+
+            for (int t = 0; t < NUM_THREADS; t++)
+            {
+                int cnt = chunk + (t < rem ? 1 : 0);
+                if (cnt <= 0) continue;
+
+                thread_args[thread_index] = (thread_block_data){
+                    .bi = i, .bj = 0, .bk = k,
+                    .A  = A, .L  = &L,
+                    .block_size = b,
+                    .start_row  = start,
+                    .end_row    = start + cnt
+                };
+                pthread_create(&threads[thread_index], NULL,
+                               solve_triangular_block,
+                               &thread_args[thread_index]);
+                thread_created[thread_index++] = true;
+                start += cnt;
+            }
+
+            for (int t = 0; t < thread_index; t++)
+                if (thread_created[t])
+                    pthread_join(threads[t], NULL);
+        }
+
+        for (int i = k + 1; i < nb; i++)
+        {
+            for (int j = k + 1; j <= i; j++)
+            {
+                for (int t = 0; t < NUM_THREADS; t++)
+                    thread_created[t] = false;
+
+                int rows = ((i*b + b) > n ? (n - i*b) : b);
+
+                int chunk = rows / NUM_THREADS;
+                int rem   = rows % NUM_THREADS;
+                int start = 0;
+                int thread_index = 0;
+
+                for (int t = 0; t < NUM_THREADS; t++)
+                {
+                    int cnt = chunk + (t < rem ? 1 : 0);
+                    if (cnt <= 0) continue;
+
+                    thread_args[thread_index] = (thread_block_data){
+                        .bi = i, .bj = j, .bk = k,
+                        .A  = A, .L  = &L,
+                        .block_size = b,
+                        .start_row  = start,
+                        .end_row    = start + cnt
+                    };
+                    pthread_create(&threads[thread_index], NULL,
+                                   update_trailing_block,
+                                   &thread_args[thread_index]);
+                    thread_created[thread_index++] = true;
+                    start += cnt;
+                }
+
+                for (int t = 0; t < thread_index; t++)
+                    if (thread_created[t])
+                        pthread_join(threads[t], NULL);
+            }
+        }
+    }
+
+    return L;
+}
+
+
+
+
+
+
 Matrix cholesky(Matrix* A, int n)
 {
     Matrix L = create_matrix_openmp(n, n);
@@ -421,6 +720,7 @@ Vector pcgPreconditioned(Matrix* A, Vector* b, Vector* xs, double err,
         p = add_vector(&r, &current_);
     }
     *iter = k;
+    *relres = second_norm(&r) / r0norm;
 
     free_vector(z);
     free_vector(r);
@@ -432,14 +732,81 @@ Vector pcgPreconditioned(Matrix* A, Vector* b, Vector* xs, double err,
     return x;
 }
 
-void pcgChol(size_t n,
-                             const char *b_filename,
-                             double eps)
+void pcgCholBlocks(size_t n,
+             const char *b_filename,
+             double eps)
+{
+    printf("=== General SPD PCG + Blocked Cholesky ===\n");
+    printf("Matrix size: %zu x %zu\n", n, n);
+
+    Matrix A = generate_general_spd(n);
+    // printf("Matrix A\n");
+    // print_matrix(&A);
+
+    Vector x_true = generate_true_x(n);
+
+    Vector b = read_vector_from_file(b_filename);
+    if ((size_t)b.size != n) {
+        fprintf(stderr, "Размер b не совпадает с размером матрицы\n");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Blocked Cholesky decomposition...\n");
+
+    int block_size = 64;
+
+    Matrix L = cholesky_blocked_pthreads(&A, (int)n, block_size);
+    // printf("Matrix L\n");
+    // print_matrix(&L);
+    // Matrix trueL = read_matrix_from_file(MATRIX_DEBUG);
+    // printf("Max diff between true and block L: %.15f\n", max_difference_between_matrices(&L, &trueL));
+    Matrix Lt = transpose(L);
+
+    Vector x0 = create_vector(n);
+    Matrix Anew = generate_general_spd(n);
+
+    double relres = 0.0;
+    int iter = 0;
+    Vector x_sol = pcgPreconditioned(
+        &Anew,
+        &b,
+        &x0,
+        eps,
+        &relres,
+        &iter,
+        &L,
+        &Lt
+    );
+
+    double max_err = max_difference_between_vectors(&x_true, &x_sol);
+
+    printf("PCG finished\n");
+    printf("Iterations: %d\n", iter);
+    printf("Relative residual: %.3e\n", relres);
+    printf("Max |x - x*|: %.3e\n", max_err);
+
+    free_vector(x_sol);
+    free_vector(x0);
+    free_vector(b);
+    free_vector(x_true);
+
+    free_matrix(&A);
+    free_matrix(&Anew);
+    free_matrix(&L);
+    free_matrix(&Lt);
+}
+
+
+void pcgChol(size_t n, const char *b_filename, double eps)
 {
     printf("=== General SPD PCG + Cholesky ===\n");
     printf("Matrix size: %zu x %zu\n", n, n);
 
     Matrix A = generate_general_spd(n);
+
+    
+    // printf("Matrix A\n");
+    // print_matrix(&A);
 
     Vector x_true = generate_true_x(n);
 
@@ -453,7 +820,10 @@ void pcgChol(size_t n,
 
     printf("Cholesky decomposition...\n");
     Matrix L = cholesky(&A, (int)n);
+    printf("Matrix L\n");
+    print_matrix(&L);
     Matrix Lt = transpose(L);
+    write_matrix_to_file(&L, MATRIX_DEBUG);
 
     Vector x0 = create_vector(n);
 
@@ -489,6 +859,51 @@ void pcgChol(size_t n,
 
 
 
+int main(int argc, char** argv)
+{
+    if (argc < 2)
+    {
+        fprintf(stderr, "Usage: %s <num_threads>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    NUM_THREADS = atoi(argv[1]);
+    if (NUM_THREADS <= 0)
+    {
+        fprintf(stderr, "Error: number of threads must be positive\n");
+        return EXIT_FAILURE;
+    }
+
+    threads = (pthread_t*)malloc(NUM_THREADS * sizeof(pthread_t));
+    thread_args = (thread_block_data*)malloc(NUM_THREADS * sizeof(thread_block_data));
+
+    if (!threads || !thread_args)
+    {
+        fprintf(stderr, "Error: failed to allocate thread structures\n");
+        free(threads);
+        free(thread_args);
+        return EXIT_FAILURE;
+    }
+
+    size_t n = 4096;
+    Matrix A = generate_general_spd(n);   
+    // print_matrix(&A);     
+    Vector x = generate_true_x(n);             
+    const char *fname = "b_vector.txt";
+
+    double maxdiff = multiply_save_read_compare(&A, &x, fname);
+
+    printf("Max difference = %.15f\n", maxdiff);
+    const char* b_filename = "b_vector.txt";
+    double eps = 1e-5;
+
+    pcgCholBlocks(n, b_filename, eps);
+
+    free(threads);
+    free(thread_args);
+
+    return 0;
+}
 
 
 // int main(int argc, char** argv)
@@ -517,7 +932,7 @@ void pcgChol(size_t n,
 //         return 1;
 //     }
 
-//     size_t n = 4096;
+//     size_t n = 15;
 //     const char *bfile = "b_vector.txt";
 //     double eps = 1e-8;
 
@@ -531,17 +946,19 @@ void pcgChol(size_t n,
 
 
 
-int main(int argc, char** argv) {
-    size_t n = 4096;
-    Matrix A = generate_general_spd(n);   
-    // print_matrix(&A);     
-    Vector x = generate_true_x(n);             
-    const char *fname = "b_vector.txt";
 
-    double maxdiff = multiply_save_read_compare(&A, &x, fname);
 
-    printf("Max difference = %.15f\n", maxdiff);
+// int main(int argc, char** argv) {
+//     size_t n = 15;
+//     Matrix A = generate_general_spd(n);   
+//     // print_matrix(&A);     
+//     Vector x = generate_true_x(n);             
+//     const char *fname = "b_vector.txt";
 
-    free_matrix(&A);
-    free_vector(x);
-}
+//     double maxdiff = multiply_save_read_compare(&A, &x, fname);
+
+//     printf("Max difference = %.15f\n", maxdiff);
+
+//     free_matrix(&A);
+//     free_vector(x);
+// }

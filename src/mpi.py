@@ -327,23 +327,45 @@ def cholesky_blocked_mpi(A, b, comm):
 
         comm.Barrier()
 
-    L = None
+    # L = None
+    # if rank == 0:
+    #     L = np.zeros_like(A)
+    #     for (i,j), blk in local_blocks.items():
+    #         Ii, Ji = i*b, j*b
+    #         L[Ii: Ii+blk.shape[0], Ji: Ji+blk.shape[1]] = blk
+    #     for r in range(1, size):
+    #         for i,j in block_indices(n,b):
+    #             if owner(i,j,size) == r:
+    #                 blk = comm.recv(source=r, tag=2000+i*nb+j)
+    #                 Ii, Ji = i*b, j*b
+    #                 L[Ii: Ii+blk.shape[0], Ji: Ji+blk.shape[1]] = blk
+    # else:
+    #     for (i,j), blk in local_blocks.items():
+    #         comm.send(blk, dest=0, tag=2000+i*nb+j)
+
+    # return L
+
+    L_global = None
+
     if rank == 0:
-        L = np.zeros_like(A)
+        L_global = np.zeros_like(A)
         for (i,j), blk in local_blocks.items():
             Ii, Ji = i*b, j*b
-            L[Ii: Ii+blk.shape[0], Ji: Ji+blk.shape[1]] = blk
+            L_global[Ii: Ii+blk.shape[0], Ji: Ji+blk.shape[1]] = blk
         for r in range(1, size):
             for i,j in block_indices(n,b):
                 if owner(i,j,size) == r:
                     blk = comm.recv(source=r, tag=2000+i*nb+j)
                     Ii, Ji = i*b, j*b
-                    L[Ii: Ii+blk.shape[0], Ji: Ji+blk.shape[1]] = blk
+                    L_global[Ii: Ii+blk.shape[0], Ji: Ji+blk.shape[1]] = blk
     else:
         for (i,j), blk in local_blocks.items():
             comm.send(blk, dest=0, tag=2000+i*nb+j)
 
-    return L
+    L_global = comm.bcast(L_global, root=0)
+
+    return L_global
+
 
 
 
@@ -356,8 +378,8 @@ def pcg_chol_MPI(filename_b, n, eps, comm):
         print(f"{A_mpi.rows = }")
     # L_mpi = cholesky_mpi(A_mpi, n, comm)
     L_mpi = cholesky_blocked_mpi(A_mpi.data, b=64, comm=MPI.COMM_WORLD)
-    if rank == 0:
-        print(f"Finished Cholesky, {L_mpi.shape = }")
+    # if rank == 0:
+    #     print(f"Finished Cholesky, {L_mpi.shape = }")
 
     if rank == 0:
         A = A_mpi.data
@@ -398,6 +420,9 @@ def main():
     eps = 1e-8
 
     pcg_chol_MPI(filename_b, n, eps, shmcomm)
+    
+    if rank == 0:
+        print("Program completed successfully")
 
 
 if __name__ == "__main__":

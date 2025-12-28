@@ -11,7 +11,7 @@ fi
 KEY="$1"
 SERVER="$2"
 LOCAL="."
-REMOTE="fived"
+REMOTE="diagf"
 
 # Check if local folder exists
 [ -d "$LOCAL" ] || { echo "Error: $LOCAL not found"; exit 1; }

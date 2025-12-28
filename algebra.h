@@ -22,6 +22,46 @@ typedef struct
     double* data;
 } Vector;
 
+// Выделяет двумерный блок размера b x b
+double** allocate_block(int b)
+{
+    // Выделяем массив указателей на строки
+    double** block = (double**)malloc(b * sizeof(double*));
+    if (!block) {
+        fprintf(stderr, "Ошибка выделения памяти для блока\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Выделяем сами строки
+    for (int i = 0; i < b; i++) {
+        block[i] = (double*)malloc(b * sizeof(double));
+        if (!block[i]) {
+            fprintf(stderr, "Ошибка выделения памяти для строки блока\n");
+            // Освобождаем уже выделенное
+            for (int j = 0; j < i; j++)
+                free(block[j]);
+            free(block);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    return block;
+}
+
+// Освобождает блок, выделенный через allocate_block
+void free_block(double** block, int b)
+{
+    if (!block) return;
+
+    // Сначала освобождаем каждую строку
+    for (int i = 0; i < b; i++) {
+        free(block[i]);
+    }
+
+    // Потом освобождаем массив указателей
+    free(block);
+}
+
 
 static void die(const char* msg)
 {
@@ -51,7 +91,7 @@ void print_matrix(Matrix* mat)
     {
         for(int j = 0; j < mat->cols; j++)
         {
-            printf("%8.2f", mat->data[i][j]);
+            printf("%8.3f", mat->data[i][j]);
         }
         printf("\n");
     }
@@ -125,6 +165,119 @@ Vector create_vector(int size)
     }
     return vec;
 }
+
+void write_matrix_to_file(const Matrix* M, const char* filename)
+{
+    FILE* f = fopen(filename, "w");
+    if (!f)
+    {
+        fprintf(stderr, "Error: cannot open file %s for writing\n", filename);
+        return;
+    }
+
+    // записываем размеры
+    fprintf(f, "%zu %zu\n", M->rows, M->cols);
+
+    // записываем элементы
+    for (size_t i = 0; i < M->rows; i++)
+    {
+        for (size_t j = 0; j < M->cols; j++)
+        {
+            fprintf(f, "%.17g ", M->data[i][j]);
+        }
+        fprintf(f, "\n");
+    }
+
+    fclose(f);
+}
+
+Matrix read_matrix_from_file(const char* filename)
+{
+    Matrix M;
+    M.rows = 0;
+    M.cols = 0;
+    M.data = NULL;
+    M.buf = NULL;
+
+    FILE* f = fopen(filename, "r");
+    if (!f)
+    {
+        fprintf(stderr, "Error: cannot open file %s for reading\n", filename);
+        return M;
+    }
+
+    // читаем размеры
+    if (fscanf(f, "%zu %zu", &M.rows, &M.cols) != 2)
+    {
+        fprintf(stderr, "Error: failed to read matrix dimensions\n");
+        fclose(f);
+        return M;
+    }
+
+    // выделяем память под строки
+    M.data = (double**)malloc(M.rows * sizeof(double*));
+    if (!M.data)
+    {
+        fprintf(stderr, "Error: memory allocation failed for matrix rows\n");
+        fclose(f);
+        return M;
+    }
+
+    // выделяем буфер под все элементы
+    M.buf = (double*)malloc(M.rows * M.cols * sizeof(double));
+    if (!M.buf)
+    {
+        fprintf(stderr, "Error: memory allocation failed for matrix data\n");
+        free(M.data);
+        fclose(f);
+        return M;
+    }
+
+    // распределяем буфер по строкам
+    for (size_t i = 0; i < M.rows; i++)
+    {
+        M.data[i] = M.buf + i * M.cols;
+    }
+
+    // читаем элементы
+    for (size_t i = 0; i < M.rows; i++)
+    {
+        for (size_t j = 0; j < M.cols; j++)
+        {
+            if (fscanf(f, "%lf", &M.data[i][j]) != 1)
+            {
+                fprintf(stderr, "Error reading element at (%zu,%zu)\n", i, j);
+            }
+        }
+    }
+
+    fclose(f);
+    return M;
+}
+
+double max_difference_between_matrices(const Matrix* A, const Matrix* B)
+{
+    if (!A || !B || A->rows != B->rows || A->cols != B->cols)
+    {
+        fprintf(stderr, "Error: matrix dimensions must match for comparison\n");
+        return -1.0;
+    }
+
+    double max_diff = 0.0;
+    for (size_t i = 0; i < A->rows; i++)
+    {
+        for (size_t j = 0; j < A->cols; j++)
+        {
+            double diff = fabs(A->data[i][j] - B->data[i][j]);
+            if (diff > max_diff)
+            {
+                max_diff = diff;
+            }
+        }
+    }
+    return max_diff;
+}
+
 
 // Освобождение памяти матрицы
 // void free_matrix(Matrix mat)

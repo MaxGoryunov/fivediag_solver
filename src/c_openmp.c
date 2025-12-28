@@ -179,13 +179,10 @@ double max_difference_between_vectors(Vector *a, Vector *b)
 double multiply_save_read_compare(Matrix *A, Vector *x,
                                   const char *filename_b)
 {
-    // 1) умножение и сохранение
     multiply_and_save(A, x, filename_b);
 
-    // 2) чтение обратно
     Vector b_from_file = read_vector_from_file(filename_b);
 
-    // 3) вычисление оригинного b
     Vector b_original = create_vector((int)A->rows);
     for (size_t i = 0; i < A->rows; ++i)
     {
@@ -195,15 +192,164 @@ double multiply_save_read_compare(Matrix *A, Vector *x,
         b_original.data[i] = sum;
     }
 
-    // 4) сравнение
     double max_diff = max_difference_between_vectors(&b_original, &b_from_file);
 
-    // Освобождение
     free_vector(b_from_file);
     free_vector(b_original);
 
     return max_diff;
 }
+
+void factorize_block(double** Ablock, double** Lblock, int b)
+{
+    for (int i = 0; i < b; i++) {
+        for (int j = 0; j < b; j++) {
+            Lblock[i][j] = Ablock[i][j];
+        }
+    }
+
+    for (int k = 0; k < b; k++) {
+        double sum = 0.0;
+        for (int p = 0; p < k; p++) {
+            sum += Lblock[k][p] * Lblock[k][p];
+        }
+        Lblock[k][k] = sqrt(Lblock[k][k] - sum);
+
+        for (int i = k + 1; i < b; i++) {
+            double sum2 = 0.0;
+            for (int p = 0; p < k; p++) {
+                sum2 += Lblock[i][p] * Lblock[k][p];
+            }
+            Lblock[i][k] = (Lblock[i][k] - sum2) / Lblock[k][k];
+        }
+    }
+}
+
+void solve_triangular_block(
+    double** Aik,
+    double** Lkk,
+    double** Lik,
+    int b)
+{
+    for (int i = 0; i < b; i++) {
+        for (int j = 0; j < b; j++) {
+            double sum = 0.0;
+            for (int p = 0; p < j; p++) {
+                sum += Lik[i][p] * Lkk[j][p];
+            }
+            Lik[i][j] = (Aik[i][j] - sum) / Lkk[j][j];
+        }
+    }
+}
+
+void update_trailing_block(
+    double** Aij,   
+    double** Lik,   
+    double** Ljk,   
+    int b)
+{
+    for (int i = 0; i < b; i++)
+    {
+        for (int j = 0; j < b; j++)
+        {
+            double sum = 0.0;
+            for (int p = 0; p < b; p++)
+            {
+                sum += Lik[i][p] * Ljk[j][p];
+            }
+            Aij[i][j] -= sum;
+        }
+    }
+}
+
+Matrix cholesky_blocked_openmp(Matrix* A, int n, int b)
+{
+    assert(A->cols == A->rows);
+    assert(A->cols == n);
+
+    Matrix L = create_matrix_openmp(n, n);
+
+    int nb = (n + b - 1) / b;
+
+    for (int k = 0; k < nb; k++)
+    {
+        int kk_size = (k*b + b > n ? n - k*b : b);
+
+        double** A_kk = allocate_block(kk_size);
+        for (int ii = 0; ii < kk_size; ii++)
+            for (int jj = 0; jj < kk_size; jj++)
+                A_kk[ii][jj] = A->data[k*b+ii][k*b+jj];
+
+        double** L_kk = allocate_block(kk_size);
+        factorize_block(A_kk, L_kk, kk_size);
+
+        for (int ii = 0; ii < kk_size; ii++)
+            for (int jj = 0; jj < kk_size; jj++)
+                L.data[k*b+ii][k*b+jj] = L_kk[ii][jj];
+
+        free_block(A_kk, kk_size);
+        free_block(L_kk, kk_size);
+
+        #pragma omp parallel for schedule(static)
+        for (int i = k+1; i < nb; i++)
+        {
+            int ik_size = (i*b + b > n ? n - i*b : b);
+
+            double** A_ik = allocate_block(ik_size);
+            for (int ii = 0; ii < ik_size; ii++)
+                for (int jj = 0; jj < kk_size; jj++)
+                    A_ik[ii][jj] = A->data[i*b+ii][k*b+jj];
+
+            double** Lik = allocate_block(ik_size);
+            solve_triangular_block(A_ik, L.data + k*b, Lik, kk_size);
+
+            for (int ii = 0; ii < ik_size; ii++)
+                for (int jj = 0; jj < kk_size; jj++)
+                    L.data[i*b+ii][k*b+jj] = Lik[ii][jj];
+
+            free_block(A_ik, ik_size);
+            free_block(Lik, ik_size);
+        }
+
+        #pragma omp parallel for schedule(static)
+        for (int i = k+1; i < nb; i++)
+        {
+            for (int j = k+1; j <= i; j++)
+            {
+                int isize = (i*b + b > n ? n - i*b : b);
+                int jsize = (j*b + b > n ? n - j*b : b);
+
+                double** A_ij = allocate_block(isize);
+                for (int ii = 0; ii < isize; ii++)
+                    for (int jj = 0; jj < jsize; jj++)
+                        A_ij[ii][jj] = A->data[i*b+ii][j*b+jj];
+
+                double** Lik  = allocate_block(isize);
+                double** Ljk  = allocate_block(jsize);
+                for (int ii = 0; ii < isize; ii++)
+                    for (int jj = 0; jj < kk_size; jj++)
+                        Lik[ii][jj] = L.data[i*b+ii][k*b+jj];
+                for (int ii = 0; ii < jsize; ii++)
+                    for (int jj = 0; jj < kk_size; jj++)
+                        Ljk[ii][jj] = L.data[j*b+ii][k*b+jj];
+
+                update_trailing_block(A_ij, Lik, Ljk, kk_size);
+
+                for (int ii = 0; ii < isize; ii++)
+                    for (int jj = 0; jj < jsize; jj++)
+                        A->data[i*b+ii][j*b+jj] = A_ij[ii][jj];
+
+                free_block(A_ij, isize);
+                free_block(Lik, isize);
+                free_block(Ljk, jsize);
+            }
+        }
+    }
+
+    return L;
+}
+
+
 
 
 Matrix cholesky(Matrix* A, int n)
@@ -390,18 +536,21 @@ void pcgCholOpenmp(size_t n, const char *b_filename, double eps)
 
     Matrix A = generate_general_spd_openmp(n);
     Vector x_true = generate_true_x(n);
+    int b = 64;
 
     printf("Running OpenMP Cholesky factorization...\n");
-    Matrix L = cholesky(&A, (int)n);
+    Matrix L = cholesky_blocked_openmp(&A, (int)n, b);
+    // Matrix L = cholesky(&A, (int)n);
     Matrix Lt = transpose(L);
 
     Vector x0 = create_vector(n);
 
     double relres = 0.0;
     int iter = 0;
+    Matrix Anew = generate_general_spd_openmp(n);
 
     Vector Xsol = pcgPreconditioned(
-        &A,
+        &Anew,
         &B,
         &x0,
         eps,
@@ -423,6 +572,7 @@ void pcgCholOpenmp(size_t n, const char *b_filename, double eps)
     free_vector(B);
     free_vector(x_true);
     free_matrix(&A);
+    free_matrix(&Anew);
     free_matrix(&L);
     free_matrix(&Lt);
 }
@@ -433,18 +583,17 @@ int main()
 {
     size_t n = 4096;
 
+    Matrix A = generate_general_spd_openmp(n);   
+    // print_matrix(&A);     
+    Vector x = generate_true_x(n);             
+    const char *fname = "b_vector.txt";
 
-    // Matrix A = generate_general_spd_openmp(n);   
-    // // print_matrix(&A);     
-    // Vector x = generate_true_x(n);             
-    // const char *fname = "b_vector.txt";
+    double maxdiff = multiply_save_read_compare(&A, &x, fname);
 
-    // double maxdiff = multiply_save_read_compare(&A, &x, fname);
+    printf("Max difference = %.15f\n", maxdiff);
 
-    // printf("Max difference = %.15f\n", maxdiff);
-
-    // free_matrix(&A);
-    // free_vector(x);
+    free_matrix(&A);
+    free_vector(x);
 
 
     const char *bfile = "b_vector.txt"; 
