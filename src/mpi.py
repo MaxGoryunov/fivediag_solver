@@ -2,48 +2,30 @@ import numpy as np
 from mpi4py import MPI
 import math
 
-class SharedMatrix:
-    def __init__(self, rows, cols, comm=None):
-        self.rows = rows
-        self.cols = cols
-        self.data = None
-        self.comm = comm if comm else MPI.COMM_WORLD
-        self.win = None
-        
-        size = rows * cols
-        if comm.Get_rank() == 0:
-            self.win = MPI.Win.Allocate_shared(size * 8, 8, comm=self.comm)
-        else:
-            self.win = MPI.Win.Allocate_shared(0, 8, comm=self.comm)
-        
-        buf, itemsize = self.win.Shared_query(0)
-        self.data = np.ndarray(buffer=buf, shape=(rows, cols), dtype=np.float64)
-        
-        if self.comm.Get_rank() == 0:
-            self.data.fill(0.0)
-        
-        self.win.Fence()
-    
-    def free(self):
-        if self.win:
-            self.win.Fence()
-            self.win.Free()
-            self.win = None
-        self.data = None
 
-def create_shared_matrix(rows, cols, comm):
-    return SharedMatrix(rows, cols, comm)
+
 
 def free_shared_matrix(mat):
     if mat:
         mat.free()
+
 
 def generate_general_spd_mpi(xn, comm):
     rank = comm.Get_rank()
     size = comm.Get_size()
 
     n = xn
-    A = create_shared_matrix(n, n, comm)
+
+    # Каждый процесс хранит полный массив A (возможно неэффективно),
+    # или можно разделить его по строкам
+    A_local = None
+    if rank == 0:
+        # rank 0 выделяет полный numpy‑массив
+        A_local = np.zeros((n, n), dtype=np.float64)
+    else:
+        A_local = np.empty((n, n), dtype=np.float64)
+
+    # Заполняем только часть, потом делаем всем bcast
     rows_per_proc = n // size
     remainder = n % size
 
@@ -51,20 +33,56 @@ def generate_general_spd_mpi(xn, comm):
     end_row = start_row + rows_per_proc + (1 if rank < remainder else 0)
 
     for i in range(start_row, end_row):
-        A.data[i, i] = 6.0 + math.sin(i) + math.cos(i*i)
+        A_local[i, i] = 6.0 + math.sin(i) + math.cos(i*i)
 
         if i > 0:
             val1 = -1.0 + 0.5 * math.sin(i)
-            A.data[i, i - 1] = val1
-            A.data[i - 1, i] = val1
+            A_local[i, i - 1] = val1
+            A_local[i - 1, i] = val1
 
         if i > 1:
             val2 = -0.5 + 0.2 * math.cos(i)
-            A.data[i, i - 2] = val2
-            A.data[i - 2, i] = val2
-    A.win.Fence()
+            A_local[i, i - 2] = val2
+            A_local[i - 2, i] = val2
 
-    return A
+    # Синхронизируем (все процессы заполняют свою часть)
+    comm.Barrier()
+
+    # Теперь делаем коллективный обмен (например Allreduce с SUM),
+    # чтобы собрать матрицу полностью на всех процессах
+    # (или только на rank 0, если нужно)
+    comm.Allreduce(MPI.IN_PLACE, A_local, op=MPI.SUM)
+
+    return A_local
+
+
+# def generate_general_spd_mpi(xn, comm):
+#     rank = comm.Get_rank()
+#     size = comm.Get_size()
+
+#     n = xn
+#     A = create_shared_matrix(n, n, comm)
+#     rows_per_proc = n // size
+#     remainder = n % size
+
+#     start_row = rank * rows_per_proc + min(rank, remainder)
+#     end_row = start_row + rows_per_proc + (1 if rank < remainder else 0)
+
+#     for i in range(start_row, end_row):
+#         A.data[i, i] = 6.0 + math.sin(i) + math.cos(i*i)
+
+#         if i > 0:
+#             val1 = -1.0 + 0.5 * math.sin(i)
+#             A.data[i, i - 1] = val1
+#             A.data[i - 1, i] = val1
+
+#         if i > 1:
+#             val2 = -0.5 + 0.2 * math.cos(i)
+#             A.data[i, i - 2] = val2
+#             A.data[i - 2, i] = val2
+#     A.win.Fence()
+
+#     return A
 
 def generate_true_x_mpi(n, comm):
     rank = comm.Get_rank()
@@ -115,55 +133,6 @@ def read_vector_from_file_mpi(filename, comm):
                 raise ValueError("File size does not match the number of values")
     b = comm.bcast(b, root=0)
     return b
-
-
-def cholesky_mpi(A, n, comm):
-    rank = comm.Get_rank()
-    size = comm.Get_size()
-    
-    if rank == 0:
-        assert A.cols == A.rows == n
-    
-    L = create_shared_matrix(n, n, comm)
-    
-    if A.win:
-        A.win.Fence()
-    
-    for j in range(n):
-        L.win.Fence()
-        
-        if rank == 0:
-            s = 0.0
-            for k in range(j):
-                s += L.data[j, k] * L.data[j, k]
-            L.data[j, j] = math.sqrt(A.data[j, j] - s)
-        
-        L.win.Fence()
-        
-        diag_val = L.data[j, j]
-        
-        remaining_rows = n - j - 1
-        if remaining_rows > 0:
-            chunk_size = remaining_rows // size
-            remainder = remaining_rows % size
-            
-            local_count = chunk_size + (1 if rank < remainder else 0)
-            
-            offset = 0
-            for p in range(rank):
-                offset += chunk_size + (1 if p < remainder else 0)
-            local_start = j + 1 + offset
-            
-            for i in range(local_start, local_start + local_count):
-                s = 0.0
-                for k in range(j):
-                    s += L.data[i, k] * L.data[j, k]
-                L.data[i, j] = (A.data[i, j] - s) / diag_val
-        
-        L.win.Fence()
-    
-    L.win.Fence()
-    return L
 
 def solve_gauss_forward(L, b):
     n = L.shape[0]
@@ -309,6 +278,7 @@ def cholesky_blocked_mpi(A, b, comm):
 
         comm.Barrier()
 
+        # Обновление хвоста
         for i in range(k+1, nb):
             for j in range(k+1, i+1):
                 if (i,j) in local_blocks:
@@ -346,7 +316,6 @@ def cholesky_blocked_mpi(A, b, comm):
     # return L
 
     L_global = None
-
     if rank == 0:
         L_global = np.zeros_like(A)
         for (i,j), blk in local_blocks.items():
@@ -363,26 +332,32 @@ def cholesky_blocked_mpi(A, b, comm):
             comm.send(blk, dest=0, tag=2000+i*nb+j)
 
     L_global = comm.bcast(L_global, root=0)
-
     return L_global
-
 
 
 
 def pcg_chol_MPI(filename_b, n, eps, comm):
     rank = comm.Get_rank()
+    size = comm.Get_size()
+    
     b_vec = read_vector_from_file_mpi(filename_b, comm)
     # print(f"Read b_vec, {len(b_vec)}")
     A_mpi = generate_general_spd_mpi(n, comm)
+    comm.Barrier()
     if rank == 0:
-        print(f"{A_mpi.rows = }")
+        print(f"{A_mpi.shape = }")
+    
     # L_mpi = cholesky_mpi(A_mpi, n, comm)
-    L_mpi = cholesky_blocked_mpi(A_mpi.data, b=64, comm=MPI.COMM_WORLD)
-    # if rank == 0:
+    L_global = cholesky_blocked_mpi(A_mpi, b=64, comm=comm)
+    # L_global = cholesky_blocked_mpi(A_mpi.data, b=64, comm=comm)
+    # L_mpi = cholesky_blocked_mpi(A_mpi.data, b=64, comm=MPI.COMM_WORLD)
+    if rank == 0:
+        print("Cholesky decomposition finished")
     #     print(f"Finished Cholesky, {L_mpi.shape = }")
+    comm.Barrier()
 
     if rank == 0:
-        A = A_mpi.data
+        A = A_mpi
         # print('A:')
         # print(A)
         # print('b (right side):')
@@ -390,7 +365,7 @@ def pcg_chol_MPI(filename_b, n, eps, comm):
         
         # if pure numpy matrix
         # L = L_mpi.data
-        L = L_mpi
+        L = L_global
         x0 = np.zeros(n, dtype=np.float64)
 
         sol, iterations, relres = pcg_preconditioned(
@@ -399,30 +374,93 @@ def pcg_chol_MPI(filename_b, n, eps, comm):
 
         print(f"eps={eps:.1e}, iterations={iterations}, relres={relres:.3e}")
 
-    free_shared_matrix(A_mpi)
+    # free_shared_matrix(A_mpi)
     # free_shared_matrix(L_mpi)
 
     comm.Barrier()
+
+# def pcg_chol_MPI(filename_b, n, eps, comm):
+#     rank = comm.Get_rank()
+#     b_vec = read_vector_from_file_mpi(filename_b, comm)
+#     # print(f"Read b_vec, {len(b_vec)}")
+#     A_mpi = generate_general_spd_mpi(n, comm)
+#     if rank == 0:
+#         print(f"{A_mpi.rows = }")
+#     # L_mpi = cholesky_mpi(A_mpi, n, comm)
+#     L_mpi = cholesky_blocked_mpi(A_mpi.data, b=64, comm=MPI.COMM_WORLD)
+#     # if rank == 0:
+#     #     print(f"Finished Cholesky, {L_mpi.shape = }")
+
+#     if rank == 0:
+#         A = A_mpi.data
+#         # print('A:')
+#         # print(A)
+#         # print('b (right side):')
+#         # print(b_vec)
+        
+#         # if pure numpy matrix
+#         # L = L_mpi.data
+#         L = L_mpi
+#         x0 = np.zeros(n, dtype=np.float64)
+
+#         sol, iterations, relres = pcg_preconditioned(
+#             A, b_vec, x0, eps, L=L, Lt=L.T
+#         )
+
+#         print(f"eps={eps:.1e}, iterations={iterations}, relres={relres:.3e}")
+
+#     free_shared_matrix(A_mpi)
+#     # free_shared_matrix(L_mpi)
+
+#     comm.Barrier()
 
 
 
 def main():
     comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    
     shmcomm = comm.Split_type(MPI.COMM_TYPE_SHARED, 0, MPI.INFO_NULL)
-    rank = shmcomm.Get_rank()
+    local_rank = shmcomm.Get_rank()
 
-    if rank == 0:
-        print("Starting MPI Python program")
+    hostname = MPI.Get_processor_name()
+    
+
+    if local_rank == 0:
+        print(f"[{hostname}] Starting MPI Python program (NODE)")
     # print(f"Starting MPI Python program on {rank = }")
+    comm.Barrier()
 
     filename_b = "b_vector.txt"
     n = 4096
     eps = 1e-8
 
-    pcg_chol_MPI(filename_b, n, eps, shmcomm)
+    pcg_chol_MPI(filename_b, n, eps, comm)
     
-    if rank == 0:
-        print("Program completed successfully")
+    if local_rank == 0:
+        print(f"[{hostname}] Program completed successfully")
+
+
+
+# def main():
+#     comm = MPI.COMM_WORLD
+#     shmcomm = comm.Split_type(MPI.COMM_TYPE_SHARED, 0, MPI.INFO_NULL)
+#     rank = shmcomm.Get_rank()
+    
+
+#     if rank == 0:
+#         print("Starting MPI Python program")
+#     # print(f"Starting MPI Python program on {rank = }")
+
+#     filename_b = "b_vector.txt"
+#     n = 4096
+#     eps = 1e-8
+
+#     pcg_chol_MPI(filename_b, n, eps, shmcomm)
+    
+#     if rank == 0:
+#         print("Program completed successfully")
 
 
 if __name__ == "__main__":

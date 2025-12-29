@@ -3,6 +3,8 @@
 #include <assert.h>
 #include <mpi.h>
 #include <stdio.h>
+#include <stdio.h>
+#include <math.h>
 
 
 typedef struct
@@ -62,6 +64,26 @@ static Matrix_MPI create_shared_matrix(size_t rows, size_t cols, MPI_Comm comm)
 
     return m;
 }
+
+Matrix_MPI create_matrix_local(size_t rows, size_t cols, MPI_Comm comm)
+{
+    Matrix_MPI m;
+    m.rows = rows;
+    m.cols = cols;
+    m.win_buf = MPI_WIN_NULL;  
+
+    // выделяем свой собственный буфер
+    m.buf = malloc(rows * cols * sizeof(double));
+    m.data = malloc(rows * sizeof(double*));
+    for(size_t i = 0; i < rows; i++)
+        m.data[i] = m.buf + i * cols;
+
+    // можно заполнить нулями
+    memset(m.buf, 0, rows * cols * sizeof(double));
+
+    return m;
+}
+
 
 static void free_shared_matrix(Matrix_MPI* mat, MPI_Comm comm)
 {
@@ -367,6 +389,420 @@ Matrix_MPI cholesky_mpi(Matrix_MPI* A, int n, MPI_Comm comm)
     return L;
 }
 
+int owner(int bi, int bj, int size) {
+    return (bi * size + bj) % size;
+}
+
+// Заполняем блоки матрицы A распределённо
+void distribute_A_blocks(double *A, int n, int b, MPI_Comm comm,
+                         int rank, int size,
+                         double **local_blocks, int *block_indices) {
+    int nb = (n + b - 1) / b;
+    if (rank == 0) {
+        // Рассылаем блоки
+        for (int i = 0; i < nb; i++) {
+            for (int j = 0; j <= i; j++) {
+                int r = owner(i, j, size);
+                int row = i * b;
+                int col = j * b;
+                int rows = (row + b > n) ? (n - row) : b;
+                int cols = (col + b > n) ? (n - col) : b;
+
+                if (r == 0) {
+                    // Сохранить локально
+                    local_blocks[i*nb + j] = malloc(rows * cols * sizeof(double));
+                    for (int ii = 0; ii < rows; ii++)
+                        for (int jj = 0; jj < cols; jj++)
+                            local_blocks[i*nb + j][ii*cols + jj] =
+                                A[(row + ii)*n + (col + jj)];
+                } else {
+                    // Отправляем блок
+                    double *tmp = malloc(rows * cols * sizeof(double));
+                    for (int ii = 0; ii < rows; ii++)
+                        for (int jj = 0; jj < cols; jj++)
+                            tmp[ii*cols + jj] = A[(row + ii)*n + (col + jj)];
+                    MPI_Send(tmp, rows*cols, MPI_DOUBLE, r, i*nb + j, comm);
+                    free(tmp);
+                }
+            }
+        }
+    } else {
+        // ПРИНИМАЕМ только нужные блоки
+        for (int i = 0; i < nb; i++) {
+            for (int j = 0; j <= i; j++) {
+                int r = owner(i, j, size);
+                int row = i * b;
+                int col = j * b;
+                int rows = (row + b > n) ? (n - row) : b;
+                int cols = (col + b > n) ? (n - col) : b;
+                if (r == rank) {
+                    local_blocks[i*nb + j] = malloc(rows*cols*sizeof(double));
+                    MPI_Recv(local_blocks[i*nb + j], rows*cols, MPI_DOUBLE,
+                             0, i*nb + j, comm, MPI_STATUS_IGNORE);
+                }
+            }
+        }
+    }
+    MPI_Barrier(comm);
+}
+
+// Высвобождает только блок памяти, выделенный для матрицы
+void free_block_mpi(double *block) {
+    if (block) free(block);
+}
+
+// Факторизация диагонального блока Lkk = chol(Akk)
+void factorize_block_mpi(double *Akk, double *Lkk, int rows, int cols) {
+    // копируем блок A -> L
+    for (int i = 0; i < rows; ++i) {
+        for (int j = 0; j <= i; ++j) {
+            Lkk[i*cols + j] = Akk[i*cols + j];
+        }
+        for (int j = i+1; j < cols; ++j) {
+            Lkk[i*cols + j] = 0.0;  // обнуляем наддиагональные элементы
+        }
+    }
+    // стандартный последовательный Cholesky
+    for (int k = 0; k < rows; ++k) {
+        double sum = 0.0;
+        for (int p = 0; p < k; ++p)
+            sum += Lkk[k*cols + p] * Lkk[k*cols + p];
+        Lkk[k*cols + k] = sqrt(Lkk[k*cols + k] - sum);
+
+        for (int i = k + 1; i < rows; ++i) {
+            double sum2 = 0.0;
+            for (int p = 0; p < k; ++p)
+                sum2 += Lkk[i*cols + p] * Lkk[k*cols + p];
+            Lkk[i*cols + k] = (Lkk[i*cols + k] - sum2) / Lkk[k*cols + k];
+        }
+    }
+}
+
+// Треугольное решение для Lik
+void solve_triangular_block_mpi(
+    double *Aik, double *Lkk, double *Lik, int rows, int cols)
+{
+    // Lik <- Aik * inv(Lkk^T)
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            double sum = 0.0;
+            for (int p = 0; p < j; p++)
+                sum += Lik[i*cols + p] * Lkk[j*cols + p];
+            Lik[i*cols + j] = (Aik[i*cols + j] - sum) / Lkk[j*cols + j];
+        }
+    }
+}
+
+// Обновление хвостового блока: Aij -= Lik * Ljk^T
+void update_trailing_block_mpi(
+    double *Aij, double *Lik, double *Ljk, int rows, int cols)
+{
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < rows; j++) {
+            double sum = 0.0;
+            for (int p = 0; p < cols; p++)
+                sum += Lik[i*cols + p] * Ljk[j*cols + p];
+            Aij[i*rows + j] -= sum;
+        }
+    }
+}
+
+
+void block_cholesky_mpi(
+    double *A,        // полная матрица A (только у rank 0, у остальных NULL)
+    int n,             // размер матрицы
+    int b,             // размер блока
+    MPI_Comm comm,
+    double *L_out      // результат L (только у rank 0, у остальных NULL)
+)
+{
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+
+    int nb = (n + b - 1) / b;
+
+    /* ---------------- Локальное хранилище блоков ---------------- */
+    double **local_blocks = calloc(nb * nb, sizeof(double*));
+    if (!local_blocks) MPI_Abort(comm, 1);
+
+    /* ---------------- Распределение блоков ---------------- */
+    if (rank == 0) {
+        for (int bi = 0; bi < nb; bi++) {
+            for (int bj = 0; bj <= bi; bj++) {
+
+                int owner = (bi * nb + bj) % size;
+                int rows = (bi*b + b <= n) ? b : (n - bi*b);
+                int cols = (bj*b + b <= n) ? b : (n - bj*b);
+
+                double *blk = malloc(rows * cols * sizeof(double));
+                if (!blk) MPI_Abort(comm, 1);
+
+                for (int ii = 0; ii < rows; ii++)
+                    for (int jj = 0; jj < cols; jj++)
+                        blk[ii*cols + jj] =
+                            A[(bi*b + ii)*n + (bj*b + jj)];
+
+                if (owner == 0) {
+                    local_blocks[bi*nb + bj] = blk;
+                } else {
+                    MPI_Send(blk, rows*cols, MPI_DOUBLE,
+                             owner, bi*nb + bj, comm);
+                    free(blk);
+                }
+            }
+        }
+    } else {
+        for (int bi = 0; bi < nb; bi++) {
+            for (int bj = 0; bj <= bi; bj++) {
+
+                int owner = (bi * nb + bj) % size;
+                if (owner == rank) {
+
+                    int rows = (bi*b + b <= n) ? b : (n - bi*b);
+                    int cols = (bj*b + b <= n) ? b : (n - bj*b);
+
+                    double *blk = malloc(rows * cols * sizeof(double));
+                    if (!blk) MPI_Abort(comm, 1);
+
+                    MPI_Recv(blk, rows*cols, MPI_DOUBLE,
+                             0, bi*nb + bj, comm, MPI_STATUS_IGNORE);
+
+                    local_blocks[bi*nb + bj] = blk;
+                }
+            }
+        }
+    }
+
+    MPI_Barrier(comm);
+
+    /* =================== ОСНОВНОЙ ЦИКЛ =================== */
+    for (int k = 0; k < nb; k++) {
+
+        int kk_rows = (k*b + b <= n) ? b : (n - k*b);
+
+        /* ---------- 1. Диагональный блок Lkk ---------- */
+        double *Lkk = malloc(kk_rows * kk_rows * sizeof(double));
+        if (!Lkk) MPI_Abort(comm, 1);
+
+        int owner_kk = (k*nb + k) % size;
+
+        if (rank == owner_kk) {
+            double *Akk = local_blocks[k*nb + k];
+            factorize_block_mpi(Akk, Lkk, kk_rows, kk_rows);
+            free(Akk);
+            local_blocks[k*nb + k] = Lkk;
+        }
+
+        MPI_Bcast(Lkk, kk_rows*kk_rows, MPI_DOUBLE, owner_kk, comm);
+
+        if (rank != owner_kk) {
+            local_blocks[k*nb + k] = Lkk;
+        }
+
+        /* ---------- 2. Блоки под диагональю ---------- */
+        for (int i = k + 1; i < nb; i++) {
+
+            int ik_rows = (i*b + b <= n) ? b : (n - i*b);
+            double *Lik = malloc(ik_rows * kk_rows * sizeof(double));
+            if (!Lik) MPI_Abort(comm, 1);
+
+            int owner_ik = (i*nb + k) % size;
+
+            if (rank == owner_ik) {
+                double *Aik = local_blocks[i*nb + k];
+                solve_triangular_block_mpi(
+                    Aik, Lkk, Lik, ik_rows, kk_rows);
+                free(Aik);
+                local_blocks[i*nb + k] = Lik;
+            }
+
+            MPI_Bcast(Lik, ik_rows*kk_rows, MPI_DOUBLE, owner_ik, comm);
+
+            if (rank != owner_ik) {
+                local_blocks[i*nb + k] = Lik;
+            }
+        }
+
+        /* ---------- 3. Обновление хвоста ---------- */
+        for (int i = k + 1; i < nb; i++) {
+            for (int j = k + 1; j <= i; j++) {
+
+                int owner_ij = (i*nb + j) % size;
+                if (rank != owner_ij) continue;
+
+                int rows = (i*b + b <= n) ? b : (n - i*b);
+                int cols = (j*b + b <= n) ? b : (n - j*b);
+                int kk = kk_rows;
+
+                double *Aij = local_blocks[i*nb + j];
+                double *Lik = local_blocks[i*nb + k];
+                double *Ljk = local_blocks[j*nb + k];
+
+                update_trailing_block_mpi(Aij, Lik, Ljk, rows, cols);
+            }
+        }
+
+        MPI_Barrier(comm);
+    }
+
+    /* ---------------- Сборка L на rank 0 ---------------- */
+    if (rank == 0) {
+        for (int bi = 0; bi < nb; bi++) {
+            for (int bj = 0; bj <= bi; bj++) {
+
+                int rows = (bi*b + b <= n) ? b : (n - bi*b);
+                int cols = (bj*b + b <= n) ? b : (n - bj*b);
+
+                double *blk = local_blocks[bi*nb + bj];
+                for (int ii = 0; ii < rows; ii++)
+                    for (int jj = 0; jj < cols; jj++)
+                        L_out[(bi*b + ii)*n + (bj*b + jj)] =
+                            blk[ii*cols + jj];
+            }
+        }
+    }
+
+    /* ---------------- Освобождение памяти ---------------- */
+    for (int i = 0; i < nb*nb; i++)
+        if (local_blocks[i]) free(local_blocks[i]);
+
+    free(local_blocks);
+}
+
+
+
+// void block_cholesky_mpi(
+//     double *A,       // полный массив (у rank0) или NULL у других
+//     int n,           // размер матрицы
+//     int b,           // размер блока
+//     MPI_Comm comm,
+//     double *L_out)   // полный результат L (у rank0), NULL у других
+// {
+//     int rank, size;
+//     MPI_Comm_rank(comm, &rank);
+//     MPI_Comm_size(comm, &size);
+
+//     int nb = (n + b - 1) / b; // количество блоков по строкам/столбцам
+
+//     // Локальные блоки каждого процесса
+//     // хранится как массив указателей на блоки размера b*b
+//     double *local_blocks[nb*nb];
+//     for (int i = 0; i < nb*nb; i++)
+//         local_blocks[i] = NULL;
+
+//     // Распределение блоков между процессами
+//     if (rank == 0) {
+//         for (int bi = 0; bi < nb; bi++) {
+//             for (int bj = 0; bj <= bi; bj++) {
+//                 int owner = (bi * nb + bj) % size;
+//                 int rows = ((bi*b + b) > n ? n - bi*b : b);
+//                 int cols = ((bj*b + b) > n ? n - bj*b : b);
+
+//                 double *block = malloc(rows*cols*sizeof(double));
+//                 for (int ii=0; ii<rows; ii++)
+//                     for (int jj=0; jj<cols; jj++)
+//                         block[ii*cols + jj] = A[(bi*b + ii)*n + (bj*b + jj)];
+
+//                 if (owner == 0) {
+//                     local_blocks[bi*nb + bj] = block;
+//                 } else {
+//                     MPI_Send(block, rows*cols, MPI_DOUBLE, owner,
+//                              bi*nb + bj, comm);
+//                     free(block);
+//                 }
+//             }
+//         }
+//     } else {
+//         for (int bi = 0; bi < nb; bi++) {
+//             for (int bj = 0; bj <= bi; bj++) {
+//                 int owner = (bi * nb + bj) % size;
+//                 if (owner == rank) {
+//                     int rows = ((bi*b + b) > n ? n - bi*b : b);
+//                     int cols = ((bj*b + b) > n ? n - bj*b : b);
+//                     double *block = malloc(rows*cols*sizeof(double));
+//                     MPI_Recv(block, rows*cols, MPI_DOUBLE,
+//                              0, bi*nb + bj, comm, MPI_STATUS_IGNORE);
+//                     local_blocks[bi*nb + bj] = block;
+//                 }
+//             }
+//         }
+//     }
+
+//     MPI_Barrier(comm);
+
+//     // Основной блочный алгоритм
+//     for (int k = 0; k < nb; k++) {
+//         // 1) Диагональный блок (k,k)
+//         double *Lkk = NULL;
+//         if (local_blocks[k*nb + k] != NULL) {
+//             int rows = ((k*b + b) > n ? n - k*b : b);
+//             double *tmp = malloc(rows*rows*sizeof(double));
+//             factorize_block_mpi(local_blocks[k*nb + k], tmp, rows, rows);
+//             free(local_blocks[k*nb + k]);
+//             local_blocks[k*nb + k] = tmp;
+//             Lkk = tmp;
+//         }
+//         // рассылка диагонального блока всем
+//         MPI_Bcast(Lkk, b*b, MPI_DOUBLE, (k*nb + k) % size, comm);
+
+//         // 2) Блоки столбца
+//         for (int i = k+1; i < nb; i++) {
+//             int idx = i*nb + k;
+//             double *Lik = local_blocks[idx];
+//             if (Lik != NULL) {
+//                 int rows = ((i*b + b) > n ? n - i*b : b);
+//                 double *tmp = malloc(rows*b*sizeof(double));
+//                 solve_triangular_block_mpi(
+//                     local_blocks[idx], Lkk, tmp, rows, b);
+//                 free(local_blocks[idx]);
+//                 local_blocks[idx] = tmp;
+//                 Lik = tmp;
+//             }
+//             MPI_Bcast(Lik, b*b, MPI_DOUBLE, idx % size, comm);
+//         }
+
+//         // 3) Обновление хвоста
+//         for (int i = k+1; i < nb; i++) {
+//             for (int j = k+1; j <= i; j++) {
+//                 int idx = i*nb + j;
+//                 if (local_blocks[idx] != NULL) {
+//                     double *Aij = local_blocks[idx];
+//                     double *Lik = local_blocks[i*nb + k];
+//                     double *Ljk = local_blocks[j*nb + k];
+//                     update_trailing_block_mpi(Aij, Lik, Ljk, b, b);
+//                 }
+//             }
+//         }
+//         MPI_Barrier(comm);
+//     }
+
+//     // Собираем L обратно на rank 0
+//     if (rank == 0) {
+//         for (int bi = 0; bi < nb; bi++) {
+//             for (int bj = 0; bj <= bi; bj++) {
+//                 int rows = ((bi*b + b) > n ? n - bi*b : b);
+//                 int cols = ((bj*b + b) > n ? n - bj*b : b);
+//                 double *block = local_blocks[bi*nb + bj];
+//                 for (int ii=0; ii<rows; ii++)
+//                     for (int jj=0; jj<cols; jj++)
+//                         L_out[(bi*b + ii)*n + (bj*b + jj)] =
+//                         block[ii*cols + jj];
+//             }
+//         }
+//     }
+
+//     // Free local blocks
+//     for (int bi = 0; bi < nb; bi++)
+//         for (int bj = 0; bj <= bi; bj++)
+//             if (local_blocks[bi*nb + bj] != NULL)
+//                 free_block_mpi(local_blocks[bi*nb + bj]);
+// }
+
+
+
+
+
 Vector solve_gauss_reverse(Matrix* U, Vector* b)
 {
     int n = U->rows;
@@ -507,136 +943,299 @@ Vector pcgPreconditioned(Matrix* A, Vector* b, Vector* xs, double err,
     return x;
 }
 
+double** make_matrix_ptrs(double *buf, size_t rows, size_t cols)
+{
+    double **data = malloc(rows * sizeof(double *));
+    if (!data) return NULL;
 
-void pcgCholMPI(size_t n, double eps, MPI_Comm comm)
+    for (size_t i = 0; i < rows; ++i)
+    {
+        data[i] = buf + i * cols;
+    }
+    return data;
+}
+
+void fill_spd_matrix(double *A, size_t n)
+{
+    // Заполняем нулями
+    for (size_t i = 0; i < n*n; ++i) {
+        A[i] = 0.0;
+    }
+
+    // Диагональные и окрестные элементы
+    for (size_t i = 0; i < n; ++i) {
+        A[i*n + i] = 6.0 + sin((double)i) + cos((double)i * (double)i);
+        if (i > 0) {
+            double v = -1.0 + 0.5 * sin((double)i);
+            A[i*n + (i-1)] = v;
+            A[(i-1)*n + i] = v;
+        }
+        if (i > 1) {
+            double v2 = -0.5 + 0.2 * cos((double)i);
+            A[i*n + (i-2)] = v2;
+            A[(i-2)*n + i] = v2;
+        }
+    }
+}
+
+
+
+void pcgCholMPI(size_t n, double eps, const char *filename_b, MPI_Comm comm)
 {
     int rank, size;
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
+    // printf("Inside Chol: rank = %i, size = %i\n", rank, size);
 
-    Matrix_MPI A_MPI = generate_general_spd_mpi(n, comm);
-    // print_matrix_mpi(&A_MPI, comm);
+    // --- Генерация SPD матрицы A и её распространение ---
+    double *A_full = malloc(n * n * sizeof(double));
+    if (!A_full) MPI_Abort(comm, 1);
+    if (rank == 0) {
+        fill_spd_matrix(A_full, n);
+    }
+    // printf("A was filled\n");
+    
+    MPI_Bcast(A_full, n*n, MPI_DOUBLE, 0, comm);
+    // printf("A was broadcasted\n");
 
-    Matrix_MPI L_MPI = cholesky_mpi(&A_MPI, (int)n, comm);
-
-    Vector x_true_mpi = generate_true_x(n);
-    // if (rank == 0) {
-    //     print_vector(&x_true_mpi);
-
+    // --- Блочное распределённое разложение Холецкого ---
+    // double *L_full = NULL;
+    double *L_full = malloc(n * n * sizeof(double));
+    // if(rank == 0) {
+    //     L_full = malloc(n * n * sizeof(double));
     // }
+    int block_size = 64;
+    // printf("Start Cholesky factorization...\n");
+    block_cholesky_mpi(A_full, n, block_size, comm, L_full);
+    // printf("Completed Cholesky factorization\n");
 
-    size_t base = n / size;
-    size_t rem  = n % size;
-
-    int *counts = malloc(size * sizeof(int));
-    int *displs = malloc(size * sizeof(int));
-    size_t offset = 0;
-    for(int p=0; p<size; ++p)
-    {
-        counts[p] = base + (p < (int)rem ? 1 : 0);
-        displs[p] = offset;
-        offset += counts[p];
-    }
-
-    size_t start = displs[rank];
-    size_t count = counts[rank];
-
-    Vector b_local = create_vector((int)count);
-    for(size_t ii = 0; ii < count; ++ii)
-    {
-        size_t i = start + ii;  // глобальный индекс строки
-
-        double sum = 0.0;
-        for(size_t j = 0; j < n; ++j)
-        {
-            sum += A_MPI.data[i][j] * x_true_mpi.data[j];
+    // --- Чтение вектора b из файла только на rank 0 ---
+    Vector b_true;
+    if(rank == 0) {
+        b_true = read_vector_from_file(filename_b);
+        if(b_true.size != (int)n) {
+            fprintf(stderr, "Vector size mismatch (%d vs %zu)\n",
+                    b_true.size, n);
+            MPI_Abort(comm, 1);
         }
-
-        b_local.data[ii] = sum;
     }
 
-    Vector b_full;
-    if(rank == 0)
-    {
-        b_full = create_vector(n);
+    // --- Распространяем вектор b всем процессам ---
+    if(rank != 0) {
+        b_true.data = malloc(n * sizeof(double));
     }
-    MPI_Gatherv(
-        b_local.data,       
-        counts[rank],       
-        MPI_DOUBLE,         
-        rank == 0 ? b_full.data : NULL,  
-        counts,             
-        displs,             
-        MPI_DOUBLE,
-        0,                  
-        comm
-    );
+    MPI_Bcast(b_true.data, n, MPI_DOUBLE, 0, comm);
 
-    free_vector(b_local);
-    free(counts);
-    free(displs);
 
-    if(rank == 0)
-    {
-        // printf("B vector");
-        // print_vector(&b_full);
-        Matrix A = {A_MPI.rows, A_MPI.cols, A_MPI.data, A_MPI.buf};
-        Matrix L = {L_MPI.rows, L_MPI.cols, L_MPI.data, L_MPI.buf};
-
-        Matrix Lt = transpose(L);
-
+    // --- PCG только на rank 0 ---
+    if(rank == 0) {
+        double *Anew = malloc(n * n * sizeof(double));
+        if (!Anew) MPI_Abort(comm, 1);
+        fill_spd_matrix(Anew, n);
+        Matrix A_mat = { n, n, make_matrix_ptrs(Anew, n, n) };
+        Matrix L_mat = { n, n, make_matrix_ptrs(L_full, n, n) };
+        // printf("Matrix A\n");
+        // print_matrix(&A_mat);
+        // Matrix Lfile = read_matrix_from_file("matrix_debug.txt");
+        Matrix Lt_mat = transpose(L_mat);
+        // printf("Max diff between L and Ltrue: %.15f\n", 
+        //     max_difference_between_matrices(&L_mat, &Lfile));
         Vector x0 = create_vector(n);
+        Vector x_true = generate_true_x(n);
 
         double relres = 0.0;
         int iter = 0;
+        // printf("Vector :\n");
+        // print_vector(&b_true);
 
-        Vector x_sol = pcgPreconditioned(&A, &b_full, &x0, eps, &relres,
-                                         &iter, &L, &Lt);
+        Vector x_sol = pcgPreconditioned(
+            &A_mat, &b_true, &x0, eps,
+            &relres, &iter,
+            &L_mat, &Lt_mat
+        );
 
-        double max_err = vectors_max_diff(&x_true_mpi, &x_sol);
+        double max_err = vectors_max_diff(&x_true, &x_sol);
 
         printf("MPI PCG finished\n");
-        printf("Iterations: %d, eps = %.3e, max_error = %.3e\n",
-                iter, eps, max_err);
+        printf("Iterations: %d, eps=%.3e, relres=%.3e max_error=%.3e\n",
+               iter, eps, relres, max_err);
 
         free_vector(x_sol);
         free_vector(x0);
-        free_matrix(&Lt);
-        free_vector(b_full);
+        free_matrix(&Lt_mat);
     }
 
-    free_vector(x_true_mpi);
-    free_shared_matrix(&A_MPI, comm);
-    free_shared_matrix(&L_MPI, comm);
+    free_vector(b_true);
+    free(A_full);
+    if(rank == 0) free(L_full);
 
     MPI_Barrier(comm);
 }
 
 
-int main(int argc, char** argv)
-{
+
+
+// void pcgCholMPI(size_t n, double eps, MPI_Comm comm)
+// {
+//     int rank, size;
+//     MPI_Comm_rank(comm, &rank);
+//     MPI_Comm_size(comm, &size);
+
+//     Matrix_MPI A_MPI = generate_general_spd_mpi(n, comm);
+    
+//     // print_matrix_mpi(&A_MPI, comm);
+
+//     Matrix_MPI L_MPI = cholesky_mpi(&A_MPI, (int)n, comm);
+
+//     Vector x_true_mpi = generate_true_x(n);
+//     // if (rank == 0) {
+//     //     print_vector(&x_true_mpi);
+
+//     // }
+
+//     size_t base = n / size;
+//     size_t rem  = n % size;
+
+//     int *counts = malloc(size * sizeof(int));
+//     int *displs = malloc(size * sizeof(int));
+//     size_t offset = 0;
+//     for(int p=0; p<size; ++p)
+//     {
+//         counts[p] = base + (p < (int)rem ? 1 : 0);
+//         displs[p] = offset;
+//         offset += counts[p];
+//     }
+
+//     size_t start = displs[rank];
+//     size_t count = counts[rank];
+
+//     Vector b_local = create_vector((int)count);
+//     for(size_t ii = 0; ii < count; ++ii)
+//     {
+//         size_t i = start + ii;  // глобальный индекс строки
+
+//         double sum = 0.0;
+//         for(size_t j = 0; j < n; ++j)
+//         {
+//             sum += A_MPI.data[i][j] * x_true_mpi.data[j];
+//         }
+
+//         b_local.data[ii] = sum;
+//     }
+
+//     Vector b_full;
+//     if(rank == 0)
+//     {
+//         b_full = create_vector(n);
+//     }
+//     MPI_Gatherv(
+//         b_local.data,       
+//         counts[rank],       
+//         MPI_DOUBLE,         
+//         rank == 0 ? b_full.data : NULL,  
+//         counts,             
+//         displs,             
+//         MPI_DOUBLE,
+//         0,                  
+//         comm
+//     );
+
+//     free_vector(b_local);
+//     free(counts);
+//     free(displs);
+
+//     if(rank == 0)
+//     {
+//         // printf("B vector");
+//         // print_vector(&b_full);
+//         Matrix A = {A_MPI.rows, A_MPI.cols, A_MPI.data, A_MPI.buf};
+//         Matrix L = {L_MPI.rows, L_MPI.cols, L_MPI.data, L_MPI.buf};
+
+//         Matrix Lt = transpose(L);
+
+//         Vector x0 = create_vector(n);
+
+//         double relres = 0.0;
+//         int iter = 0;
+
+//         Vector x_sol = pcgPreconditioned(&A, &b_full, &x0, eps, &relres,
+//                                          &iter, &L, &Lt);
+
+//         double max_err = vectors_max_diff(&x_true_mpi, &x_sol);
+
+//         printf("MPI PCG finished\n");
+//         printf("Iterations: %d, eps = %.3e, max_error = %.3e\n",
+//                 iter, eps, max_err);
+
+//         free_vector(x_sol);
+//         free_vector(x0);
+//         free_matrix(&Lt);
+//         free_vector(b_full);
+//     }
+
+//     free_vector(x_true_mpi);
+//     free_shared_matrix(&A_MPI, comm);
+//     free_shared_matrix(&L_MPI, comm);
+
+//     MPI_Barrier(comm);
+// }
+
+
+
+int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
 
-    MPI_Comm shmcomm;
-    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED,
-                        0, MPI_INFO_NULL, &shmcomm);
+    MPI_Comm comm = MPI_COMM_WORLD;
+    int rank;
+    MPI_Comm_rank(comm, &rank);
+    int size;
+    MPI_Comm_size(comm, &size);
 
-    int rank, size;
-    MPI_Comm_rank(shmcomm, &rank);
-    MPI_Comm_size(shmcomm, &size);
 
-    if(rank == 0)
-    {
-        printf("Starting MPI program with %d processes (shared)\n", size);
+    if(rank == 0) {
+        printf("Starting MPI program with %d processes\n",
+               (int)size);
     }
 
-    size_t n = 4096;
-    double eps = 1e-5;
+    size_t n       = 4096;
+    double eps     = 1e-5;
+    const char* file_b = "b_vector.txt";
 
-    MPI_Barrier(shmcomm);
+    MPI_Barrier(comm);
 
-    pcgCholMPI(n, eps, shmcomm);
+    pcgCholMPI(n, eps, file_b, comm);
 
     MPI_Finalize();
     return 0;
 }
+
+
+
+
+// int main(int argc, char** argv)
+// {
+//     MPI_Init(&argc, &argv);
+
+//     MPI_Comm shmcomm;
+//     MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED,
+//                         0, MPI_INFO_NULL, &shmcomm);
+
+//     int rank, size;
+//     MPI_Comm_rank(shmcomm, &rank);
+//     MPI_Comm_size(shmcomm, &size);
+
+//     if(rank == 0)
+//     {
+//         printf("Starting MPI program with %d processes (shared)\n", size);
+//     }
+
+//     size_t n = 4096;
+//     double eps = 1e-5;
+
+//     MPI_Barrier(shmcomm);
+
+//     pcgCholMPI(n, eps, shmcomm);
+
+//     MPI_Finalize();
+//     return 0;
+// }

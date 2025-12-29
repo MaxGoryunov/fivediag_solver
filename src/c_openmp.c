@@ -351,8 +351,6 @@ Matrix cholesky_blocked_openmp(Matrix* A, int n, int b)
 
 
 
-
-Matrix cholesky(Matrix* A, int n)
 {
     Matrix L = create_matrix_openmp(n, n);
     assert(A->cols == A->rows);
